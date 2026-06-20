@@ -1528,7 +1528,17 @@ impl NetManager {
                     .split(|b| *b == b':')
                     .map(|s| String::from_utf8_lossy(s).parse::<i32>().unwrap_or(0))
                     .collect::<Vec<i32>>();
-                state.world.add_end(data[0], &pos);
+                // Count *other* connected peers. iter_peer_ids() includes self for
+                // the host on both backends (Steam pushes my_id; the tangled host
+                // has PeerId(0) == self in its peer set), so filter self out here.
+                let my_id = self.peer.my_id();
+                let n_peers = self
+                    .peer
+                    .iter_peer_ids()
+                    .into_iter()
+                    .filter(|p| *p != my_id)
+                    .count();
+                state.world.add_end(data[0], &pos, n_peers);
             }
             key => {
                 error!("Unknown bin msg from mod: {:?}", key)

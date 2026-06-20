@@ -335,7 +335,9 @@ impl WorldManager {
             .apply_noita_update(&update, &mut self.is_storage_recent);
     }
 
-    pub(crate) fn add_end(&mut self, priority: u8, pos: &[i32]) {
+    /// `n_peers` is the number of *other* connected peers (excluding self), used
+    /// to decide when a chunk can be broadcast once instead of sent per peer.
+    pub(crate) fn add_end(&mut self, priority: u8, pos: &[i32], n_peers: usize) {
         let updated_chunks = self
             .outbound_model
             .updated_chunks()
@@ -353,18 +355,37 @@ impl WorldManager {
             .map(|chunk| self.chunk_updated_locally(*chunk, priority, pos))
             .collect();
         let mut chunk_packet: FxHashMap<OmniPeerId, Vec<(ChunkDelta, u8)>> = FxHashMap::default();
+        // A chunk whose listeners are *every* connected peer is encoded once and
+        // broadcast, instead of re-encoded+recompressed per recipient (the
+        // dominant world-sync cost at 3+ peers). Broadcast reaches exactly those
+        // listeners, so the recipient set is identical to the per-peer path —
+        // behavior-preserving. Gated to 2+ other peers: with one listener a
+        // broadcast saves no encoding and would only add a self-handled copy.
+        let mut broadcast_packet: Vec<(ChunkDelta, u8)> = Vec::new();
         for (who_sending, delta) in per_chunk {
             let Some(delta) = delta else {
                 continue;
             };
-            for (peer, pri) in who_sending {
-                chunk_packet
-                    .entry(peer)
-                    .or_default()
-                    .push((delta.clone(), pri));
+            if n_peers >= 2 && who_sending.len() == n_peers {
+                broadcast_packet.push((delta, priority));
+            } else {
+                for (peer, pri) in who_sending {
+                    chunk_packet
+                        .entry(peer)
+                        .or_default()
+                        .push((delta.clone(), pri));
+                }
             }
         }
         let mut emit_queue = Vec::new();
+        if !broadcast_packet.is_empty() {
+            emit_queue.push((
+                Destination::Broadcast,
+                WorldNetMessage::ChunkPacket {
+                    chunkpacket: broadcast_packet,
+                },
+            ));
+        }
         for (peer, chunkpacket) in chunk_packet {
             emit_queue.push((
                 Destination::Peer(peer),
@@ -3420,12 +3441,16 @@ fn test_cut_perf() {
 }
 
 // Helper: set up `grid`x`grid` authority chunks, each fully changed (material
-// from `mat_for`), with a single remote listener — a freshly-dug region the host
-// must fan out. This is the `add_end`/`get_chunk_delta` path (on
+// from `mat_for`), with `listeners` as the remote listeners — a freshly-dug
+// region the host must fan out. This is the `add_end`/`get_chunk_delta` path (on
 // `outbound_model`), which the `cut_through_world_*` perf tests do NOT exercise
 // (they work on chunk_storage, not outbound_model).
 #[cfg(test)]
-fn setup_authority_grid(grid: i32, mat_for: impl Fn(i32, i32) -> u16) -> WorldManager {
+fn setup_authority_grid(
+    grid: i32,
+    mat_for: impl Fn(i32, i32) -> u16,
+    listeners: &[OmniPeerId],
+) -> WorldManager {
     let (mut world, _, _, _, _) =
         WorldManager::new(true, OmniPeerId(0), SaveState::new("/tmp/ew_tmp_save"));
     for i in 0..grid {
@@ -3434,12 +3459,10 @@ fn setup_authority_grid(grid: i32, mat_for: impl Fn(i32, i32) -> u16) -> WorldMa
             world
                 .outbound_model
                 .apply_chunk_data(coord, &ChunkData::new(mat_for(i, j)));
-            let mut listeners = FxHashSet::default();
-            listeners.insert(OmniPeerId(1));
             world.chunk_state.insert(
                 coord,
                 ChunkState::Authority {
-                    listeners,
+                    listeners: listeners.iter().copied().collect(),
                     priority: 0,
                     new_authority: None,
                     stop_sending: false,
@@ -3458,9 +3481,9 @@ fn test_add_end_perf() {
     let iters = 16;
     let mut total = 0;
     for _ in 0..iters {
-        let mut world = setup_authority_grid(grid, |_, _| 2);
+        let mut world = setup_authority_grid(grid, |_, _| 2, &[OmniPeerId(1)]);
         let timer = std::time::Instant::now();
-        world.add_end(0, &[0, 0, 0, 0, 0, 0]);
+        world.add_end(0, &[0, 0, 0, 0, 0, 0], 1);
         total += timer.elapsed().as_micros();
     }
     println!("add_end total micros: {}", total / iters);
@@ -3477,7 +3500,8 @@ fn test_add_end_perf() {
 fn test_add_end_emits_one_packet_per_peer_with_all_deltas() {
     let grid = 2;
     let mat_for = |i: i32, j: i32| (2 + i * grid + j) as u16;
-    let mut world = setup_authority_grid(grid, mat_for);
+    // One listener (n_peers = 1) keeps this on the per-peer path.
+    let mut world = setup_authority_grid(grid, mat_for, &[OmniPeerId(1)]);
     let mut expected = FxHashSet::default();
     for i in 0..grid {
         for j in 0..grid {
@@ -3485,7 +3509,7 @@ fn test_add_end_emits_one_packet_per_peer_with_all_deltas() {
         }
     }
 
-    world.add_end(0, &[0, 0, 0, 0, 0, 0]);
+    world.add_end(0, &[0, 0, 0, 0, 0, 0], 1);
 
     let packets: Vec<_> = world
         .emitted_messages
@@ -3520,4 +3544,56 @@ fn test_add_end_emits_one_packet_per_peer_with_all_deltas() {
             delta.chunk_coord
         );
     }
+}
+
+// 2.3: when every connected peer listens to a chunk, add_end must encode the
+// deltas once and emit them as a single Broadcast ChunkPacket, not one per peer.
+// This drives the gate directly (n_peers passed in); the call-site self-filter
+// that computes n_peers from iter_peer_ids() is not exercised here.
+#[cfg(test)]
+#[test]
+#[serial]
+fn test_add_end_broadcasts_when_all_peers_listen() {
+    let grid = 2;
+    let mat_for = |i: i32, j: i32| (2 + i * grid + j) as u16;
+    let listeners = [OmniPeerId(1), OmniPeerId(2)];
+    let mut world = setup_authority_grid(grid, mat_for, &listeners);
+    let mut expected = FxHashSet::default();
+    for i in 0..grid {
+        for j in 0..grid {
+            expected.insert(ChunkCoord(i, j));
+        }
+    }
+
+    world.add_end(0, &[0, 0, 0, 0, 0, 0], listeners.len());
+
+    let per_peer = world
+        .emitted_messages
+        .iter()
+        .filter(|m| {
+            matches!(m.msg, WorldNetMessage::ChunkPacket { .. })
+                && matches!(m.dst, Destination::Peer(_))
+        })
+        .count();
+    assert_eq!(
+        per_peer, 0,
+        "no per-peer ChunkPackets when all peers listen"
+    );
+
+    let broadcasts: Vec<_> = world
+        .emitted_messages
+        .iter()
+        .filter_map(|m| match (&m.dst, &m.msg) {
+            (Destination::Broadcast, WorldNetMessage::ChunkPacket { chunkpacket }) => {
+                Some(chunkpacket)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(broadcasts.len(), 1, "exactly one broadcast ChunkPacket");
+    let coords: FxHashSet<ChunkCoord> = broadcasts[0].iter().map(|(d, _)| d.chunk_coord).collect();
+    assert_eq!(
+        coords, expected,
+        "broadcast carries every changed chunk once"
+    );
 }
