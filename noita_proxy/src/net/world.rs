@@ -343,20 +343,25 @@ impl WorldManager {
             .copied()
             .collect::<Vec<_>>();
         self.current_update += 1;
-        let chunks_to_send: Vec<Vec<(OmniPeerId, u8)>> = updated_chunks
+        // Compute each changed chunk's RLE delta once. chunk_updated_locally
+        // already computes it for authority chunks (to build ListenUpdate), so
+        // thread it back here instead of recomputing via get_chunk_delta — a full
+        // 16384-pixel scan per chunk that previously ran a second time per frame.
+        // Each entry: (peers to send this chunk's delta to, the delta itself).
+        let per_chunk: Vec<_> = updated_chunks
             .iter()
             .map(|chunk| self.chunk_updated_locally(*chunk, priority, pos))
             .collect();
         let mut chunk_packet: FxHashMap<OmniPeerId, Vec<(ChunkDelta, u8)>> = FxHashMap::default();
-        for (chunk, who_sending) in updated_chunks.iter().zip(chunks_to_send.iter()) {
-            let Some(delta) = self.outbound_model.get_chunk_delta(*chunk, false) else {
+        for (who_sending, delta) in per_chunk {
+            let Some(delta) = delta else {
                 continue;
             };
             for (peer, pri) in who_sending {
                 chunk_packet
-                    .entry(*peer)
+                    .entry(peer)
                     .or_default()
-                    .push((delta.clone(), *pri));
+                    .push((delta.clone(), pri));
             }
         }
         let mut emit_queue = Vec::new();
@@ -372,12 +377,18 @@ impl WorldManager {
         self.outbound_model.reset_change_tracking();
     }
 
+    /// Processes a locally-changed chunk and returns the peers that should
+    /// receive its delta plus the delta itself — computed once here for the
+    /// authority case (to build `ListenUpdate`) so `add_end` doesn't recompute
+    /// it. Only the `Authority` arm ever fills the peer list or produces a
+    /// delta, so a `None` delta always pairs with an empty peer list and
+    /// `add_end` can safely skip it.
     fn chunk_updated_locally(
         &mut self,
         chunk: ChunkCoord,
         priority: u8,
         pos: &[i32],
-    ) -> Vec<(OmniPeerId, u8)> {
+    ) -> (Vec<(OmniPeerId, u8)>, Option<ChunkDelta>) {
         if pos.len() == 6 {
             self.my_pos = (pos[0], pos[1]);
             self.cam_pos = (pos[2], pos[3]);
@@ -400,6 +411,7 @@ impl WorldManager {
         let mut emit_queue = Vec::new();
         self.chunk_last_update.insert(chunk, self.current_update);
         let mut chunks_to_send = Vec::new();
+        let mut delta_out = None;
         match entry {
             ChunkState::Listening {
                 authority,
@@ -450,7 +462,7 @@ impl WorldManager {
                 stop_sending,
             } => {
                 let Some(delta) = self.outbound_model.get_chunk_delta(chunk, false) else {
-                    return Vec::new();
+                    return (Vec::new(), None);
                 };
                 if *pri != priority {
                     *pri = priority;
@@ -495,13 +507,14 @@ impl WorldManager {
                 if new_auth_got && new_auth.is_some() {
                     *stop_sending = true
                 }
+                delta_out = Some(delta);
             }
             _ => {}
         }
         for (dst, msg) in emit_queue {
             self.emit_msg(dst, msg)
         }
-        chunks_to_send
+        (chunks_to_send, delta_out)
     }
 
     pub(crate) fn update(&mut self) {
@@ -3404,4 +3417,107 @@ fn test_cut_perf() {
         total += timer.elapsed().as_micros();
     }
     println!("total micros: {}", total / iters);
+}
+
+// Helper: set up `grid`x`grid` authority chunks, each fully changed (material
+// from `mat_for`), with a single remote listener — a freshly-dug region the host
+// must fan out. This is the `add_end`/`get_chunk_delta` path (on
+// `outbound_model`), which the `cut_through_world_*` perf tests do NOT exercise
+// (they work on chunk_storage, not outbound_model).
+#[cfg(test)]
+fn setup_authority_grid(grid: i32, mat_for: impl Fn(i32, i32) -> u16) -> WorldManager {
+    let (mut world, _, _, _, _) =
+        WorldManager::new(true, OmniPeerId(0), SaveState::new("/tmp/ew_tmp_save"));
+    for i in 0..grid {
+        for j in 0..grid {
+            let coord = ChunkCoord(i, j);
+            world
+                .outbound_model
+                .apply_chunk_data(coord, &ChunkData::new(mat_for(i, j)));
+            let mut listeners = FxHashSet::default();
+            listeners.insert(OmniPeerId(1));
+            world.chunk_state.insert(
+                coord,
+                ChunkState::Authority {
+                    listeners,
+                    priority: 0,
+                    new_authority: None,
+                    stop_sending: false,
+                },
+            );
+        }
+    }
+    world
+}
+
+#[cfg(test)]
+#[test]
+#[serial]
+fn test_add_end_perf() {
+    let grid = 16; // 16x16 = 256 authority chunks
+    let iters = 16;
+    let mut total = 0;
+    for _ in 0..iters {
+        let mut world = setup_authority_grid(grid, |_, _| 2);
+        let timer = std::time::Instant::now();
+        world.add_end(0, &[0, 0, 0, 0, 0, 0]);
+        total += timer.elapsed().as_micros();
+    }
+    println!("add_end total micros: {}", total / iters);
+}
+
+// Behavior guard for the delta-once refactor (add_end had no coverage before).
+// The listener must get exactly one ChunkPacket carrying every changed chunk
+// once, and — with a distinct material per chunk — each delta must reconstruct
+// to ITS OWN coord's pixels, so a dropped/duplicated chunk OR a delta paired to
+// the wrong coord fails here.
+#[cfg(test)]
+#[test]
+#[serial]
+fn test_add_end_emits_one_packet_per_peer_with_all_deltas() {
+    let grid = 2;
+    let mat_for = |i: i32, j: i32| (2 + i * grid + j) as u16;
+    let mut world = setup_authority_grid(grid, mat_for);
+    let mut expected = FxHashSet::default();
+    for i in 0..grid {
+        for j in 0..grid {
+            expected.insert(ChunkCoord(i, j));
+        }
+    }
+
+    world.add_end(0, &[0, 0, 0, 0, 0, 0]);
+
+    let packets: Vec<_> = world
+        .emitted_messages
+        .iter()
+        .filter_map(|m| match &m.msg {
+            WorldNetMessage::ChunkPacket { chunkpacket }
+                if m.dst == Destination::Peer(OmniPeerId(1)) =>
+            {
+                Some(chunkpacket)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(packets.len(), 1, "exactly one ChunkPacket to the listener");
+    let coords: FxHashSet<ChunkCoord> = packets[0].iter().map(|(d, _)| d.chunk_coord).collect();
+    assert_eq!(coords, expected, "packet carries every changed chunk once");
+
+    // Each delta must carry its own coord's pixels. Reconstruct via the public
+    // apply/read-back path and compare to the material that coord was seeded with
+    // (fully-changed chunks => the delta reconstructs the whole chunk).
+    let mut recon = WorldModel::default();
+    for (delta, _) in packets[0] {
+        recon.apply_chunk_delta(delta);
+        let got = recon
+            .get_chunk_data(delta.chunk_coord)
+            .expect("reconstructed chunk")
+            .runs;
+        let want = ChunkData::new(mat_for(delta.chunk_coord.0, delta.chunk_coord.1)).runs;
+        assert_eq!(
+            got, want,
+            "delta for {:?} carries wrong pixels",
+            delta.chunk_coord
+        );
+    }
 }
