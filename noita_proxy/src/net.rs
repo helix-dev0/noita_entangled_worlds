@@ -45,6 +45,7 @@ use tracing::{error, info, warn};
 mod audio;
 mod des;
 pub mod messages;
+mod net_stats;
 mod proxy_opt;
 pub mod steam_networking;
 pub mod world;
@@ -234,6 +235,7 @@ pub struct NetManager {
     pub players_sprite: Mutex<FxHashMap<OmniPeerId, (Option<WorldPos>, bool, bool, RgbaImage)>>,
     pub reset_map: AtomicBool,
     colors: Mutex<FxHashMap<u16, u32>>,
+    net_stats: net_stats::NetStats,
 }
 
 impl NetManager {
@@ -276,6 +278,7 @@ impl NetManager {
             no_chunkmap_to_players: AtomicBool::new(true),
             no_chunkmap: AtomicBool::new(true),
             colors: Default::default(),
+            net_stats: net_stats::NetStats::new(),
         }
         .into()
     }
@@ -294,7 +297,10 @@ impl NetManager {
             // Shortcut for sending stuff to myself
             let _ = self.loopback_channel.0.send(msg.clone());
         } else {
-            let encoded = lz4_flex::compress_prepend_size(&bitcode::encode(msg));
+            let raw = bitcode::encode(msg);
+            let encoded = lz4_flex::compress_prepend_size(&raw);
+            self.net_stats
+                .record_outbound(msg, raw.len(), encoded.len());
             let len = encoded.len();
             if let Err(err) = self.peer.send(peer, encoded, reliability) {
                 if cfg!(debug_assertions) {
@@ -310,7 +316,10 @@ impl NetManager {
     }
 
     pub(crate) fn broadcast(&self, msg: &NetMsg, reliability: Reliability) {
-        let encoded = lz4_flex::compress_prepend_size(&bitcode::encode(msg));
+        let raw = bitcode::encode(msg);
+        let encoded = lz4_flex::compress_prepend_size(&raw);
+        self.net_stats
+            .record_outbound(msg, raw.len(), encoded.len());
         let len = encoded.len();
         if let Err(err) = self.peer.broadcast(encoded, reliability) {
             warn!("Error while broadcasting message of len {}: {}", len, err)
@@ -726,12 +735,15 @@ impl NetManager {
                 }
             }
             omni::OmniNetworkEvent::Message { src, data } => {
-                let Some(net_msg) = lz4_flex::decompress_size_prepended(&data)
+                let Some((net_msg, raw_len)) = lz4_flex::decompress_size_prepended(&data)
                     .ok()
-                    .and_then(|decomp| bitcode::decode::<NetMsg>(&decomp).ok())
+                    .and_then(|decomp| {
+                        Some((bitcode::decode::<NetMsg>(&decomp).ok()?, decomp.len()))
+                    })
                 else {
                     return;
                 };
+                self.net_stats.record_inbound(&net_msg, raw_len, data.len());
                 self.handle_net_msg(state, player_image, src, net_msg, tx, sendm);
             }
         }
