@@ -1,52 +1,29 @@
-## Noita Entangled Worlds v1.6.3
+## Noita Entangled Worlds v1.6.4 (helix-dev0 fork)
 
-1.7 changes were stashed away for now in order to release fixes we've had.
+A fork build on top of upstream v1.6.3, focused on **multiplayer connection reliability and performance**. The Lua mod is functionally unchanged from upstream; the changes are in the proxy / networking layer.
 
-Special thanks to Multirious for going through hundreds of commits and cherry-picking ones that are actually useful.
+This build is self-contained: it downloads its mod and checks for updates from this fork, not upstream.
 
-Notable changes in this release:
- - Local health alternate fixes and changes by @k-Knight and @Multirious. Dead players now use a special entity instead of a potion mimic.
- - Reimplementation of internally used polymorph effect by @k-Knight. Polymorph immunity shouldn't be able to break it anymore.
- - Updated French and Spanish translations by @leBourreau and @Icey-the-dragon.
- - Many internal improvements (see list of accepted pull requests).
+### Networking / performance
+- **Encode-once fan-out** — the proxy no longer re-encodes + recompresses a message once per recipient. Entity-sync messages are encoded once and the same bytes are sent to every peer (O(peers) → O(1) encode/compress on that path).
+- **quinn transport tuning** — BBR congestion control (recovers far better than the default Cubic on lossy home/wireless links) plus the ACK-frequency extension, on both the direct-IP client and server.
+- **TCP_NODELAY** on the game↔proxy localhost link (disables Nagle on the latency-critical path).
+- **Network instrumentation** — set `NP_NET_STATS=1` to log per-message-type traffic (counts, wire vs raw bytes) every few seconds.
+- **Build profiles** tuned for more representative local testing and a leaner shipped binary.
 
-## Accepted pull requests
-
-- add darwin support to nix package by @Random-Scientist in #490
-- Made heart statue walk by @k-Knight in #485
-- Fix for the failed polymorph in local health logic by @k-Knight in #484
-- Alternate local health tweaks and fixes by @Multirious in #483
-- Fix cli not reading settings by @Multirious in #482
-- Fix AudioSettings::disabled still trying to interact with audio library by @Multirious in #481
-- Fix paths not set in cli by @Multirious in #479
-- Path handling rewrite by @Multirious in #478
-- Overridable settings path by @Multirious in #474
-- Refactor noita-proxy UI code by @Multirious in #473
-- Update Nix and cross-compilation by @Multirious in #471
-- Refactor nix with `nixfmt` by @Multirious in #470
-- ci: add matrix build for macOS (Intel & ARM64) by @artemkloko in #467
-- Added Transtlation to spanish by @Icey-the-dragon in #451
-- Fixed github release macos and lint workflow by @Icey-the-dragon in #450
-- Complete French translation by @leBourreau in #446
-- Create Linux (Lutris) install guide and automatic startup script by @LeoMerlino in #434
-- nix+flake: init with noita-proxy package, overlay, and devshell  by @spikespaz in #432
-- Add instructions to use proxy on MacOs by @RoenaltAstrophore in #426
+### Robustness / safety
+- Bounded incoming message length on the direct-IP path — an oversized or malicious length is rejected before allocating, instead of risking OOM or a panic.
+- Voice chat disables gracefully if the audio codec fails to initialize (previously a panic).
+- Removed a process-wide working-directory change + unwrap from the game launcher.
 
 ## Installation
 
+Download and unpack `noita_proxy-win.zip` or `noita_proxy-linux.zip` for your OS, then launch the proxy.
 
-Download and unpack `noita_proxy-win.zip` or `noita_proxy-linux.zip`, depending on your OS. After that, launch the proxy.
+The proxy downloads and installs the mod automatically — there is no need to download `quant.ew.zip` manually.
 
-
-Proxy is able to download and install the mod automatically. There is no need to download the mod (`quant.ew.zip`) manually.
-
-
-You'll be prompted for a path to `noita.exe` when launching the proxy for the first time.
-It should be detected automatically as long as you use steam version of the game and steam is launched.
-        
+You'll be prompted for the path to `noita.exe` on first launch; it's auto-detected for the Steam version when Steam is running.
 
 ## Updating
 
-
-There is a button in bottom-left corner on noita_proxy's main screen that allows to auto-update to a new version when one is available
-
+The button in the bottom-left of the proxy's main screen auto-updates to a newer version from this fork when one is available.
