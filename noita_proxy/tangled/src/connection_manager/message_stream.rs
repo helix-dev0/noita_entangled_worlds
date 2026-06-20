@@ -38,8 +38,8 @@ impl<Msg: Encode> SendMessageStream<Msg> {
 
     async fn send_raw(&mut self, msg: &[u8]) -> Result<(), DirectConnectionError> {
         validate_len(msg.len())?;
-        let len =
-            u32::try_from(msg.len()).map_err(|_| DirectConnectionError::MessageTooLong(msg.len()))?;
+        let len = u32::try_from(msg.len())
+            .map_err(|_| DirectConnectionError::MessageTooLong(msg.len()))?;
         self.inner
             .write_u32(len)
             .await
