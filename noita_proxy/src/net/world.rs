@@ -347,7 +347,7 @@ impl WorldManager {
             .iter()
             .map(|chunk| self.chunk_updated_locally(*chunk, priority, pos))
             .collect();
-        let mut chunk_packet: HashMap<OmniPeerId, Vec<(ChunkDelta, u8)>> = HashMap::new();
+        let mut chunk_packet: FxHashMap<OmniPeerId, Vec<(ChunkDelta, u8)>> = FxHashMap::default();
         for (chunk, who_sending) in updated_chunks.iter().zip(chunks_to_send.iter()) {
             let Some(delta) = self.outbound_model.get_chunk_delta(*chunk, false) else {
                 continue;

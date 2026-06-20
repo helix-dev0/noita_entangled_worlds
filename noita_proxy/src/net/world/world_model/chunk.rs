@@ -1,7 +1,6 @@
 use std::num::NonZeroU16;
 
 use bitcode::{Decode, Encode};
-use crossbeam::atomic::AtomicCell;
 
 use super::{
     CHUNK_SIZE, ChunkData,
@@ -95,8 +94,6 @@ impl Default for CompactPixel {
 pub struct Chunk {
     pixels: [u16; CHUNK_SQUARE],
     changed: Changed<bool, CHUNK_SQUARE>,
-    any_changed: bool,
-    crc: AtomicCell<Option<u64>>,
 }
 
 struct Changed<T: Default, const N: usize>([T; N]);
@@ -149,8 +146,6 @@ impl Default for Chunk {
         Self {
             pixels: [4095; CHUNK_SQUARE],
             changed: Changed([false; CHUNK_SQUARE]),
-            any_changed: false,
-            crc: None.into(),
         }
     }
 }
@@ -186,13 +181,10 @@ impl Chunk {
 
     pub fn mark_changed(&mut self, offset: usize) {
         self.changed.set(offset);
-        self.any_changed = true;
-        self.crc.store(None);
     }
 
     pub fn clear_changed(&mut self) {
         self.changed = Changed([false; CHUNK_SQUARE]);
-        self.any_changed = false;
     }
 
     pub fn to_chunk_data(&self) -> ChunkData {

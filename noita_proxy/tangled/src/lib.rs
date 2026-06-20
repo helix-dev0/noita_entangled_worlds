@@ -8,9 +8,11 @@ use connection_manager::{
 
 pub use error::NetError;
 
-/// Maximum size of a message which fits into a single datagram.
-/// Somewhat arbitrary, but if it gets this large something probably went wrong.
-pub const MAX_MESSAGE_LEN: usize = 2 * 1024 * 1024 * 1024;
+/// Upper bound on a single message's length, enforced on both send and receive
+/// so a bogus or malicious wire length can't drive a multi-gigabyte allocation.
+/// Deliberately generous (real EW messages are far smaller); tighten once
+/// Phase 0 size data confirms the largest legitimate message (map/mod sync).
+pub const MAX_MESSAGE_LEN: usize = 256 * 1024 * 1024;
 
 mod common;
 mod connection_manager;

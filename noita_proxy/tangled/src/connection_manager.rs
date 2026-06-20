@@ -55,6 +55,18 @@ enum DirectConnectionError {
     MessageIoFailed,
     #[error("Failed to decode message")]
     DecodeError,
+    #[error("Message length {0} exceeds MAX_MESSAGE_LEN")]
+    MessageTooLong(usize),
+}
+
+/// Log (but otherwise ignore) an outbound message dropped for exceeding
+/// MAX_MESSAGE_LEN, so a too-low limit surfaces in logs instead of a peer
+/// silently receiving partial state. Other send errors stay best-effort
+/// (a broken peer tears its own connection down).
+fn log_dropped_too_long(result: Result<(), DirectConnectionError>) {
+    if let Err(e @ DirectConnectionError::MessageTooLong(_)) = result {
+        warn!("Outbound message dropped: {e}");
+    }
 }
 
 struct DirectPeer {
@@ -415,8 +427,7 @@ impl ConnectionManager {
         let peer = self.shared.direct_peers.get_mut(&peer_id);
         // TODO handle lack of peer?
         if let Some(mut peer) = peer {
-            // TODO handle errors
-            peer.send_stream.send(msg).await.ok();
+            log_dropped_too_long(peer.send_stream.send(msg).await);
         }
     }
 
@@ -428,8 +439,7 @@ impl ConnectionManager {
         for mut peer in self.shared.direct_peers.iter_mut() {
             let peer_id = *peer.key();
             if peer_id != excluded {
-                // TODO handle errors
-                peer.send_stream.send(&value).await.ok();
+                log_dropped_too_long(peer.send_stream.send(&value).await);
             }
         }
     }
@@ -471,8 +481,14 @@ impl ConnectionManager {
                     if self.is_server {
                         self.server_send_to_peers(msg).await;
                     } else {
-                        // TODO handle error
-                        self.host_conn.as_mut().unwrap().send_stream.send(&InternalMessage::Normal(msg)).await.ok();
+                        log_dropped_too_long(
+                            self.host_conn
+                                .as_mut()
+                                .unwrap()
+                                .send_stream
+                                .send(&InternalMessage::Normal(msg))
+                                .await,
+                        );
                     }
                 }
                 ev = self.internal_events_r.recv() => {
