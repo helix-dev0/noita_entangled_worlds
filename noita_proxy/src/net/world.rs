@@ -1242,14 +1242,17 @@ impl WorldManager {
             flags: PixelFlags::Normal,
             material: 0,
         };
-        let chunk_storage: Vec<(ChunkCoord, ChunkData)> = self
-            .chunk_storage
-            .clone()
-            .into_par_iter()
-            .filter(|(coord, _)| {
-                min_cx <= coord.0 && max_cx >= coord.0 && coord.1 <= max_cy && coord.1 >= min_cy
-            })
-            .map(|(chunk_coord, chunk_encoded)| {
+        // Only chunks in the cut's bounding box can be affected; walk that range
+        // directly instead of cloning + parallel-scanning the whole world (the
+        // clone of every loaded chunk dominated the cost). Same chunks (those in
+        // the box that exist in storage), same per-chunk cut, same result.
+        let mut updated: Vec<(ChunkCoord, ChunkData)> = Vec::new();
+        for cx in min_cx..=max_cx {
+            for cy in min_cy..=max_cy {
+                let chunk_coord = ChunkCoord(cx, cy);
+                let Some(chunk_encoded) = self.chunk_storage.get(&chunk_coord) else {
+                    continue;
+                };
                 let chunk_start_x = chunk_coord.0 * CHUNK_SIZE as i32;
                 let chunk_end_x = chunk_start_x + CHUNK_SIZE as i32;
                 let chunk_start_y = chunk_coord.1 * CHUNK_SIZE as i32;
@@ -1269,11 +1272,11 @@ impl WorldManager {
                         );
                     }
                 }
-                (chunk_coord, chunk.to_chunk_data())
-            })
-            .collect();
-        for entry in chunk_storage.into_iter() {
-            self.chunk_storage.insert(entry.0, entry.1);
+                updated.push((chunk_coord, chunk.to_chunk_data()));
+            }
+        }
+        for (coord, data) in updated {
+            self.chunk_storage.insert(coord, data);
         }
     }
     pub(crate) fn cut_through_world_line(
