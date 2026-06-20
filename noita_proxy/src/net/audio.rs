@@ -94,7 +94,7 @@ struct PlayerInfo {
 pub(crate) struct AudioManager {
     per_player: HashMap<OmniPeerId, PlayerInfo>,
     stream_handle: Option<OutputStream>,
-    decoder: Decoder,
+    decoder: Option<Decoder>,
     rx: Receiver<Vec<u8>>,
 }
 
@@ -126,7 +126,9 @@ impl AudioManager {
                 host.default_input_device()
             }
         };
-        let decoder = Decoder::new(SAMPLE_RATE as u32, CHANNELS).unwrap();
+        let decoder = Decoder::new(SAMPLE_RATE as u32, CHANNELS)
+            .inspect_err(|e| warn!("opus decoder init failed, incoming voice disabled: {e:?}"))
+            .ok();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             if let Some(device) = device {
@@ -142,8 +144,12 @@ impl AudioManager {
                     if let Ok(mut resamp) =
                         FftFixedIn::<f32>::new(sample.0 as usize, SAMPLE_RATE, FRAME_SIZE, 8, 1)
                     {
-                        let mut encoder =
-                            Encoder::new(SAMPLE_RATE as u32, CHANNELS, Application::Audio).unwrap();
+                        let Ok(mut encoder) =
+                            Encoder::new(SAMPLE_RATE as u32, CHANNELS, Application::Audio)
+                        else {
+                            warn!("opus encoder init failed, voice capture disabled");
+                            return;
+                        };
                         let mut extra = Vec::new();
                         match device.build_input_stream(
                             &config.into(),
@@ -268,7 +274,8 @@ impl AudioManager {
                 let mut dec: Vec<f32> = Vec::new();
                 for data in data {
                     let mut out = vec![0f32; FRAME_SIZE];
-                    if let Ok(len) = self.decoder.decode_float(&data, &mut out, false)
+                    if let Some(decoder) = self.decoder.as_mut()
+                        && let Ok(len) = decoder.decode_float(&data, &mut out, false)
                         && len != 0
                     {
                         dec.extend(&out[..len])
