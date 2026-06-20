@@ -204,7 +204,6 @@ impl LaunchToken<'_> {
         let child = if let Some(game_path) = &start_cmd.noita_install {
             let steam_install = start_cmd.steam_install.clone().unwrap();
             let compat_data = start_cmd.noita_compat_data.clone().unwrap();
-            std::env::set_current_dir(game_path).unwrap();
 
             info!("Steam install: {}", steam_install.display());
             info!("Compat data: {}", compat_data.display());
