@@ -91,6 +91,16 @@ pub enum PeerVariant {
     Steam(steam_networking::SteamPeer),
 }
 
+fn map_steam_err(e: SteamError) -> tangled::NetError {
+    match e {
+        SteamError::InvalidSteamID => tangled::NetError::UnknownPeer,
+        SteamError::Ignored => tangled::NetError::Dropped,
+        SteamError::InvalidParameter => tangled::NetError::MessageTooLong,
+        SteamError::NoConnection | SteamError::InvalidState => tangled::NetError::Disconnected,
+        _ => tangled::NetError::Other,
+    }
+}
+
 impl PeerVariant {
     pub(crate) fn send(
         &self,
@@ -100,18 +110,26 @@ impl PeerVariant {
     ) -> Result<(), tangled::NetError> {
         match self {
             PeerVariant::Tangled(p) => p.send(peer.into(), msg, reliability),
-            PeerVariant::Steam(p) => {
-                p.send_message(peer.into(), &msg, reliability)
-                    .map_err(|e| match e {
-                        SteamError::InvalidSteamID => tangled::NetError::UnknownPeer,
-                        SteamError::Ignored => tangled::NetError::Dropped,
-                        SteamError::InvalidParameter => tangled::NetError::MessageTooLong,
-                        SteamError::NoConnection | SteamError::InvalidState => {
-                            tangled::NetError::Disconnected
-                        }
-                        _ => tangled::NetError::Other,
-                    })
-            }
+            PeerVariant::Steam(p) => p
+                .send_message(peer.into(), &msg, reliability)
+                .map_err(map_steam_err),
+        }
+    }
+
+    /// Send already-encoded bytes without re-encoding. For fan-out to many
+    /// peers: encode once, then reuse the buffer here (tangled copies it into a
+    /// Vec, Steam sends the slice directly).
+    pub(crate) fn send_encoded(
+        &self,
+        peer: OmniPeerId,
+        bytes: &[u8],
+        reliability: Reliability,
+    ) -> Result<(), tangled::NetError> {
+        match self {
+            PeerVariant::Tangled(p) => p.send(peer.into(), bytes.to_vec(), reliability),
+            PeerVariant::Steam(p) => p
+                .send_message(peer.into(), bytes, reliability)
+                .map_err(map_steam_err),
         }
     }
 

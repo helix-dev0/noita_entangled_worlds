@@ -326,6 +326,37 @@ impl NetManager {
         }
     }
 
+    /// Encode `msg` once and fan it out to `peers`. Re-encoding and
+    /// recompressing per recipient is the dominant cost on this path, so we pay
+    /// it once and reuse the bytes (tangled copies the buffer per peer, Steam
+    /// reuses the slice). Our own id goes through the loopback channel, matching
+    /// `send`.
+    pub(crate) fn send_many(&self, peers: &[OmniPeerId], msg: &NetMsg, reliability: Reliability) {
+        match peers {
+            [] => {}
+            [peer] => self.send(*peer, msg, reliability),
+            peers => {
+                let raw = bitcode::encode(msg);
+                let encoded = lz4_flex::compress_prepend_size(&raw);
+                for &peer in peers {
+                    if peer == self.peer.my_id() {
+                        let _ = self.loopback_channel.0.send(msg.clone());
+                        continue;
+                    }
+                    self.net_stats
+                        .record_outbound(msg, raw.len(), encoded.len());
+                    if let Err(err) = self.peer.send_encoded(peer, &encoded, reliability) {
+                        warn!(
+                            "Error while sending message of len {}: {}",
+                            encoded.len(),
+                            err
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn clean_dir(path: PathBuf) {
         let tmp = path.parent().unwrap().join("tmp");
         if tmp.exists() {
@@ -1238,19 +1269,7 @@ impl NetManager {
                 let reliability = Reliability::from_reliability_bool(reliable);
                 match destination {
                     Destination::Peers(peers) => {
-                        if !peers.is_empty() {
-                            if peers.len() == 1 {
-                                self.send(peers[0], &NetMsg::RemoteMsg(message), reliability)
-                            } else {
-                                for peer in peers {
-                                    self.send(
-                                        peer,
-                                        &NetMsg::RemoteMsg(message.clone()),
-                                        reliability,
-                                    )
-                                }
-                            }
-                        }
+                        self.send_many(&peers, &NetMsg::RemoteMsg(message), reliability)
                     }
                     Destination::Peer(peer) => {
                         self.send(peer, &NetMsg::RemoteMsg(message), reliability)
