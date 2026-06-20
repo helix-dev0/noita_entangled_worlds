@@ -68,9 +68,22 @@ winresource = "0.1.17"
 [profile.dev]
 opt-level = 1
 
+# Optimize the per-frame-hot dependencies even in dev builds so local
+# multiplayer testing (`just run`) reflects realistic encode/compress/SIMD cost.
+# Our own crates stay at opt-level 1 for fast iteration.
+[profile.dev.package.bitcode]
+opt-level = 3
+[profile.dev.package.lz4_flex]
+opt-level = 3
+[profile.dev.package.wide]
+opt-level = 3
+
 [profile.release]
 lto = true
+codegen-units = 1
 strip = true
 
+# Used by scripts/prepare_release.py (`cross build --profile release-lto`).
+# Inherits the fully-optimized release profile above.
 [profile.release-lto]
 inherits = "release"
