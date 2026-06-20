@@ -296,7 +296,7 @@ impl NetManager {
         } else {
             let encoded = lz4_flex::compress_prepend_size(&bitcode::encode(msg));
             let len = encoded.len();
-            if let Err(err) = self.peer.send(peer, encoded.clone(), reliability) {
+            if let Err(err) = self.peer.send(peer, encoded, reliability) {
                 if cfg!(debug_assertions) {
                     warn!(
                         "Error while sending message of len {}: {} {:?}",
