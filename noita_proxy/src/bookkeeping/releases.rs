@@ -204,9 +204,15 @@ impl Release {
     }
 }
 
+/// GitHub repo this build pulls its mod and self-update from. Point this at the
+/// fork so a fork build is self-contained (its own mod + update channel).
+const RELEASE_REPO: &str = "helix-dev0/noita_entangled_worlds";
+
 pub fn get_latest_release(client: &Client) -> Result<Release, ReleasesError> {
     let response = client
-        .get("https://api.github.com/repos/IntQuant/noita_entangled_worlds/releases/latest")
+        .get(format!(
+            "https://api.github.com/repos/{RELEASE_REPO}/releases/latest"
+        ))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .header("User-agent", "noita proxy")
@@ -218,7 +224,7 @@ pub fn get_latest_release(client: &Client) -> Result<Release, ReleasesError> {
 
 pub fn get_release_by_tag(client: &Client, tag: Tag) -> Result<Release, ReleasesError> {
     let url = format!(
-        "https://api.github.com/repos/IntQuant/noita_entangled_worlds/releases/tags/{}",
+        "https://api.github.com/repos/{RELEASE_REPO}/releases/tags/{}",
         tag.0
     );
     let response = client
@@ -240,6 +246,7 @@ mod test {
     use crate::releases::{Tag, get_release_by_tag};
 
     #[test]
+    #[ignore = "network test: hits the GitHub API for a specific release"]
     fn release_assets() {
         let client = reqwest::blocking::Client::new();
         // let release = get_latest_release(&client).unwrap();
