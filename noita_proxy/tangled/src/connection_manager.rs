@@ -256,7 +256,7 @@ impl ConnectionManager {
             Endpoint::client(bind_addr).map_err(TangledInitError::CouldNotCreateEndpoint)?
         };
 
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(
+        let mut client_config = ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(
                 rustls::ClientConfig::builder()
                     .dangerous()
@@ -264,7 +264,9 @@ impl ConnectionManager {
                     .with_no_client_auth(),
             )
             .unwrap(),
-        )));
+        ));
+        client_config.transport_config(shared_transport_config());
+        endpoint.set_default_client_config(client_config);
 
         Ok(Self {
             shared,
@@ -527,6 +529,18 @@ impl ConnectionManager {
     }
 }
 
+/// Transport tuning shared by client and server: BBR (recovers far better than
+/// the default Cubic on lossy home/wireless links), ACK-frequency (cuts ACK
+/// overhead; ignored if the peer lacks the extension), and a keep-alive to hold
+/// NAT mappings open.
+fn shared_transport_config() -> Arc<TransportConfig> {
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    transport.ack_frequency_config(Some(quinn::AckFrequencyConfig::default()));
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    Arc::new(transport)
+}
+
 fn default_server_config() -> ServerConfig {
     let cert = rcgen::generate_simple_self_signed(vec!["tangled".into()]).unwrap();
     let cert_der = CertificateDer::from(cert.cert);
@@ -534,8 +548,6 @@ fn default_server_config() -> ServerConfig {
 
     let mut config =
         ServerConfig::with_single_cert(vec![cert_der.clone()], priv_key.into()).unwrap();
-    let mut transport_config = TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
-    config.transport_config(Arc::new(transport_config));
+    config.transport_config(shared_transport_config());
     config
 }
