@@ -55,6 +55,8 @@ enum DirectConnectionError {
     MessageIoFailed,
     #[error("Failed to decode message")]
     DecodeError,
+    #[error("Message length {0} exceeds MAX_MESSAGE_LEN")]
+    MessageTooLong(usize),
 }
 
 struct DirectPeer {
