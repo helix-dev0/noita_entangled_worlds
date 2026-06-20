@@ -469,7 +469,12 @@ impl SteamPeer {
         let send_type = if reliability == Reliability::Reliable {
             SendFlags::RELIABLE
         } else {
-            SendFlags::UNRELIABLE
+            // NoNagle on the latency-sensitive (unreliable) path: positions /
+            // camera / voice go out immediately instead of waiting to coalesce.
+            // Reliable bulk keeps Nagle batching. This is a local send-timing
+            // hint only -- no wire change, so it stays compatible with peers on
+            // older builds.
+            SendFlags::UNRELIABLE_NO_NAGLE
         };
 
         self.connections.send_message(peer, send_type, msg)
