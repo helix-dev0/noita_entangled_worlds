@@ -70,6 +70,12 @@ local Controls = ffi.typeof("Controls")
 local CharacterPos = ffi.typeof("CharacterPos")
 local FireWand = ffi.typeof("FireWand")
 
+-- Remote-player movement smoothing (receiver-side interpolation). Tune live.
+local INTERP_DELAY = 0.06 -- seconds of render delay; the puppet is rendered at now - INTERP_DELAY
+local BUFFER_SIZE = 8 -- max position samples kept per remote player
+local MAX_EXTRAP = 0.15 -- seconds; cap on extrapolation past the newest sample
+local TELEPORT_THRESHOLD_SQ = 256 * 256 -- a jump between consecutive samples beyond this snaps (no interp)
+
 local player_fns = {
     deserialize_inputs = function(message, player_data)
         if player_data ~= nil and player_data.entity ~= nil and EntityGetIsAlive(player_data.entity) then
@@ -386,10 +392,16 @@ local player_fns = {
             fps = 60,
             last_hit = 0,
             dc = false,
+            pos_buffer = {}, -- receiver-side interpolation: array of {x, y, t} samples, oldest first
+            interp_entity = nil, -- entity the buffer was built for; mismatch -> reset (respawn/replace)
             mutations = { ghost = false, luuki = false, rat = false, fungus = false, halo = 0 },
         }
     end,
 }
+
+-- Refreshed once per frame from the "smooth others movement" ModSetting (in player_sync). When
+-- false, deserialize_position falls back to the legacy snap and interpolate_player is a no-op.
+player_fns.smoothing_enabled = true
 
 function player_fns.serialize_position(player_data)
     local entity = player_data.entity
@@ -447,7 +459,127 @@ function player_fns.deserialize_position(message, phys_infos, player_data)
     if not util.set_phys_info(entity, phys_infos, player_data.fps) then
         local m = player_data.fps / ctx.my_player.fps
         ComponentSetValue2(character_data, "mVelocity", message.vel_x * m, message.vel_y * m)
-        EntityApplyTransform(entity, message.x, message.y)
+        -- Buffer the sample for per-frame interpolation (applied post-physics in on_world_update_post).
+        -- Always warm the buffer so toggling smoothing on is instant; when smoothing is off, also snap
+        -- now so behaviour matches the legacy path exactly.
+        player_fns.push_position_sample(player_data, message.x, message.y, GameGetRealWorldTimeSinceStarted())
+        if not player_fns.smoothing_enabled then
+            EntityApplyTransform(entity, message.x, message.y)
+        end
+    else
+        -- Physics-object (polymorph) path positions the body itself; drop any stale samples so
+        -- interpolation stays skipped and re-seeds (snaps) when the player reverts to normal.
+        local buf = player_data.pos_buffer
+        if buf ~= nil then
+            for i = #buf, 1, -1 do
+                buf[i] = nil
+            end
+        end
+    end
+end
+
+-- Append a received position sample; detect teleports and cap the buffer length. The post-physics
+-- step (interpolate_player) is the sole writer of the puppet transform, so this never moves it.
+function player_fns.push_position_sample(player_data, x, y, t)
+    local buf = player_data.pos_buffer
+    if buf == nil then
+        buf = {}
+        player_data.pos_buffer = buf
+    end
+    -- Reset when the puppet entity changed (respawn / replace / polymorph swap) so we never
+    -- interpolate across samples from different entities. The receive path is the sole owner of
+    -- interp_entity and buffer resets, and runs regardless of the smoothing toggle.
+    if player_data.interp_entity ~= player_data.entity then
+        for i = #buf, 1, -1 do
+            buf[i] = nil
+        end
+        player_data.interp_entity = player_data.entity
+    end
+    local n = #buf
+    if n > 0 then
+        local last = buf[n]
+        local dx, dy = x - last.x, y - last.y
+        if dx * dx + dy * dy > TELEPORT_THRESHOLD_SQ then
+            -- Teleport / respawn / world-change: don't interpolate across the gap; start fresh so
+            -- the next frame snaps to the new sample (single-sample case below).
+            for i = n, 1, -1 do
+                buf[i] = nil
+            end
+            n = 0
+        end
+    end
+    buf[n + 1] = { x = x, y = y, t = t }
+    while #buf > BUFFER_SIZE do
+        table.remove(buf, 1)
+    end
+end
+
+-- Per frame (post-physics): render the remote puppet at an interpolated, time-delayed position so
+-- its motion is smooth despite jittery unreliable updates. Read-only over the sample buffer.
+function player_fns.interpolate_player(player_data, now)
+    if not player_fns.smoothing_enabled then
+        return
+    end
+    local entity = player_data.entity
+    if entity == nil or not EntityGetIsAlive(entity) then
+        return
+    end
+    local buf = player_data.pos_buffer
+    if buf == nil then
+        return
+    end
+    if player_data.dc then
+        return -- frozen while disconnected; the buffer is reset on reconnect (rpc.player_update)
+    end
+    -- The receive path (push_position_sample) owns buffer resets. If the entity changed but no new
+    -- sample has been pushed yet (e.g. a respawn between frames), don't render the new puppet from
+    -- the old entity's samples -- wait for the next received sample to reset the buffer.
+    if player_data.interp_entity ~= entity then
+        return
+    end
+    local n = #buf
+    if n == 0 then
+        return
+    end
+    if n == 1 then
+        EntityApplyTransform(entity, buf[1].x, buf[1].y)
+        return
+    end
+    local render_time = now - INTERP_DELAY
+    if render_time <= buf[1].t then
+        -- Older than the oldest buffered sample: clamp to oldest.
+        EntityApplyTransform(entity, buf[1].x, buf[1].y)
+        return
+    end
+    local newest = buf[n]
+    if render_time <= newest.t then
+        -- Interpolate between the two samples that bracket render_time.
+        for i = n, 2, -1 do
+            local a, b = buf[i - 1], buf[i]
+            if render_time >= a.t and render_time <= b.t then
+                local span = b.t - a.t
+                local alpha = (span > 0) and ((render_time - a.t) / span) or 1
+                EntityApplyTransform(entity, a.x + (b.x - a.x) * alpha, a.y + (b.y - a.y) * alpha)
+                return
+            end
+        end
+        -- Shouldn't reach here; clamp to newest as a safety net.
+        EntityApplyTransform(entity, newest.x, newest.y)
+    else
+        -- render_time is past the newest sample (gap/drop): extrapolate from a finite-difference
+        -- velocity (px/sec from our own clock), capped to MAX_EXTRAP so a long gap can't fling it.
+        local prev = buf[n - 1]
+        local span = newest.t - prev.t
+        local vx, vy = 0, 0
+        if span > 0 then
+            vx = (newest.x - prev.x) / span
+            vy = (newest.y - prev.y) / span
+        end
+        local dt = render_time - newest.t
+        if dt > MAX_EXTRAP then
+            dt = MAX_EXTRAP
+        end
+        EntityApplyTransform(entity, newest.x + vx * dt, newest.y + vy * dt)
     end
 end
 

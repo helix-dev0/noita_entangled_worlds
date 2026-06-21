@@ -79,6 +79,13 @@ function rpc.player_update(input_data, pos_data, phys_info, current_slot, team)
     if player_data.dc then
         player_data.dc = false
         undc(player_data.entity)
+        -- Drop buffered position samples so the reconnecting puppet snaps fresh, not slides.
+        local buf = player_data.pos_buffer
+        if buf ~= nil then
+            for i = #buf, 1, -1 do
+                buf[i] = nil
+            end
+        end
         return
     end
 
@@ -381,6 +388,22 @@ function module.on_world_update()
             find_later = true
             has_twwe_locally = nil
             twwe_x, twwe_y = nil, nil
+        end
+    end
+end
+
+function module.on_world_update_post()
+    -- Receiver-side smoothing of remote players: render each remote puppet at an interpolated,
+    -- time-delayed position. Runs post-physics so EntityApplyTransform is the frame's last writer,
+    -- pinning the puppet exactly while its mVelocity (set pre-physics) still drives sprite animation.
+    player_fns.smoothing_enabled = ModSettingGet("quant.ew.smooth_others") ~= false
+    if not player_fns.smoothing_enabled then
+        return
+    end
+    local now = GameGetRealWorldTimeSinceStarted()
+    for peer_id, player_data in pairs(ctx.players) do
+        if peer_id ~= ctx.my_id then
+            player_fns.interpolate_player(player_data, now)
         end
     end
 end
