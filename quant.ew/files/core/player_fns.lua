@@ -71,7 +71,7 @@ local CharacterPos = ffi.typeof("CharacterPos")
 local FireWand = ffi.typeof("FireWand")
 
 -- Remote-player movement smoothing (receiver-side interpolation). Tune live.
-local INTERP_DELAY = 0.06 -- seconds of render delay; the puppet is rendered at now - INTERP_DELAY
+local INTERP_DELAY = 0.10 -- fallback render delay (s) before a per-player gap EMA is established
 local BUFFER_SIZE = 8 -- max position samples kept per remote player
 local MAX_EXTRAP = 0.15 -- seconds; cap on extrapolation past the newest sample
 local TELEPORT_THRESHOLD_SQ = 256 * 256 -- a jump between consecutive samples beyond this snaps (no interp)
@@ -394,6 +394,8 @@ local player_fns = {
             dc = false,
             pos_buffer = {}, -- receiver-side interpolation: array of {x, y, t} samples, oldest first
             interp_entity = nil, -- entity the buffer was built for; mismatch -> reset (respawn/replace)
+            gap_ema = nil, -- EMA of inter-sample arrival gap (s); drives the adaptive render delay
+            last_sample_t = nil, -- receive time of the previous sample, for the gap EMA
             mutations = { ghost = false, luuki = false, rat = false, fungus = false, halo = 0 },
         }
     end,
@@ -512,6 +514,15 @@ function player_fns.push_position_sample(player_data, x, y, t)
     while #buf > BUFFER_SIZE do
         table.remove(buf, 1)
     end
+    -- Track the receive cadence: an EMA of the inter-sample gap drives the adaptive render delay in
+    -- interpolate_player, so smoothing self-fits whatever rate the proxy actually delivers.
+    if player_data.last_sample_t ~= nil then
+        local gap = t - player_data.last_sample_t
+        if gap > 0 then
+            player_data.gap_ema = (player_data.gap_ema or gap) * 0.9 + gap * 0.1
+        end
+    end
+    player_data.last_sample_t = t
 end
 
 -- Per frame (post-physics): render the remote puppet at an interpolated, time-delayed position so
@@ -545,7 +556,19 @@ function player_fns.interpolate_player(player_data, now)
         EntityApplyTransform(entity, buf[1].x, buf[1].y)
         return
     end
-    local render_time = now - INTERP_DELAY
+    -- Adaptive render delay: ~2.5x the observed inter-sample gap so render_time reliably lands
+    -- between two buffered samples (true interpolation) instead of clamping/snapping. Falls back to
+    -- INTERP_DELAY until the gap EMA is established. Clamped to keep added latency sane.
+    local delay = INTERP_DELAY
+    if player_data.gap_ema ~= nil then
+        delay = player_data.gap_ema * 2.5
+        if delay < 0.08 then
+            delay = 0.08
+        elseif delay > 0.20 then
+            delay = 0.20
+        end
+    end
+    local render_time = now - delay
     if render_time <= buf[1].t then
         -- Older than the oldest buffered sample: clamp to oldest.
         EntityApplyTransform(entity, buf[1].x, buf[1].y)
