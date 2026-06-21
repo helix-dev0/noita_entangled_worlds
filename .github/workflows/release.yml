@@ -1,6 +1,15 @@
 name: release
 
-on: [push, pull_request]
+# Build + publish only on version tags. PRs/merges are gated by lint.yml (fmt+clippy,
+# which compiles on Linux); cross-platform build breakage surfaces here at tag time.
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-mod:
