@@ -263,6 +263,13 @@ local function build_settings()
                     value_default = false,
                     scope = MOD_SETTING_SCOPE_RUNTIME,
                 },
+                {
+                    id = "smooth_others",
+                    ui_name = "smooth others movement",
+                    ui_description = "interpolate remote players for smoother motion (small added delay)",
+                    value_default = true,
+                    scope = MOD_SETTING_SCOPE_RUNTIME,
+                },
             },
         },
         {
