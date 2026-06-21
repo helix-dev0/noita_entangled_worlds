@@ -665,6 +665,14 @@ impl WorldManager {
                 // Models are basically caches, no need to keep the chunk around in them.
                 self.inbound_model.forget_chunk(*chunk);
                 self.outbound_model.forget_chunk(*chunk);
+                // Drop the per-chunk metadata too, otherwise these maps grow for the
+                // whole session as chunks are explored and unloaded (host and client).
+                // `is_storage_recent` must never outlive its `chunk_storage` entry; we
+                // keep `chunk_storage` on unload, so dropping the flag here is safe (a
+                // later read falls through to the retained storage copy).
+                self.chunk_last_update.remove(chunk);
+                self.last_request_priority.remove(chunk);
+                self.is_storage_recent.remove(chunk);
             }
             retain
         });
@@ -690,6 +698,13 @@ impl WorldManager {
         self.chunk_last_update.clear();
         self.chunk_state.clear();
         self.is_storage_recent.clear();
+        // These also need clearing on a world/dimension change — otherwise the
+        // request-priority cache and the deferred-explosion buffers carry stale
+        // state into the new world and grow unbounded across the session.
+        self.last_request_priority.clear();
+        self.explosion_pointer.clear();
+        self.explosion_data.clear();
+        self.explosion_heap.clear();
     }
 
     pub(crate) fn get_emitted_msgs(&mut self) -> Vec<MessageRequest<WorldNetMessage>> {
@@ -1242,6 +1257,11 @@ impl WorldManager {
         }
         for c in to_remove {
             self.chunk_state.remove(&c);
+            // Same per-chunk cleanup as the unload path, so a peer leaving doesn't
+            // leave its chunks' metadata behind.
+            self.chunk_last_update.remove(&c);
+            self.last_request_priority.remove(&c);
+            self.is_storage_recent.remove(&c);
         }
         if !self.is_host {
             return;
@@ -2111,6 +2131,13 @@ impl WorldManager {
             } else {
                 self.explosion_data[i].2 = ExTarget::Radius(0)
             }
+        }
+        // Once no chunk has pending deferred explosions, nothing references these
+        // append-only buffers anymore (all indices come from `explosion_pointer`),
+        // so reclaim them instead of letting them grow for the whole session.
+        if self.explosion_pointer.is_empty() {
+            self.explosion_data.clear();
+            self.explosion_heap.clear();
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -3595,5 +3622,98 @@ fn test_add_end_broadcasts_when_all_peers_listen() {
     assert_eq!(
         coords, expected,
         "broadcast carries every changed chunk once"
+    );
+}
+
+// Leak guard: when a chunk unloads, its per-chunk metadata must be dropped from
+// the auxiliary maps (not just from chunk_state/models), otherwise these grow for
+// the whole session and the host/clients get laggier over time. A near chunk that
+// stays loaded must keep its entries, proving we evict only unloaded chunks.
+#[cfg(test)]
+#[test]
+#[serial]
+fn unload_clears_aux_maps_for_far_chunks() {
+    let (mut world, _, _, _, _) = WorldManager::new(
+        true,
+        OmniPeerId(0),
+        SaveState::new("/tmp/ew_tmp_save_unload"),
+    );
+    // Player/camera at origin so the keep-window is centered there. The default
+    // my_pos/cam_pos is i32::MIN/2, which would unload every chunk indiscriminately.
+    world.my_pos = (0, 0);
+    world.cam_pos = (0, 0);
+
+    let far: Vec<ChunkCoord> = (10..30).map(|i| ChunkCoord(i, i)).collect();
+    let near = ChunkCoord(1, 1);
+    for &c in far.iter().chain(std::iter::once(&near)) {
+        world.chunk_state.insert(c, ChunkState::WaitingForAuthority);
+        world.chunk_last_update.insert(c, 7);
+        world.last_request_priority.insert(c, 3);
+        world.is_storage_recent.insert(c);
+    }
+
+    world.update();
+
+    for c in &far {
+        assert!(
+            !world.chunk_state.contains_key(c),
+            "{c:?} should have unloaded"
+        );
+        assert!(
+            !world.chunk_last_update.contains_key(c),
+            "chunk_last_update leaked for {c:?}"
+        );
+        assert!(
+            !world.last_request_priority.contains_key(c),
+            "last_request_priority leaked for {c:?}"
+        );
+        assert!(
+            !world.is_storage_recent.contains(c),
+            "is_storage_recent leaked for {c:?}"
+        );
+    }
+    // The still-loaded near chunk keeps all of its metadata.
+    assert!(world.chunk_state.contains_key(&near));
+    assert!(world.chunk_last_update.contains_key(&near));
+    assert!(world.last_request_priority.contains_key(&near));
+    assert!(world.is_storage_recent.contains(&near));
+}
+
+// Guard the reset() additions: a world/dimension change must clear the
+// request-priority cache and all deferred-explosion buffers, which previously
+// survived reset and accumulated across the session.
+#[cfg(test)]
+#[test]
+#[serial]
+fn reset_clears_request_priority_and_explosion_state() {
+    let (mut world, _, _, _, _) = WorldManager::new(
+        true,
+        OmniPeerId(0),
+        SaveState::new("/tmp/ew_tmp_save_reset"),
+    );
+    world.last_request_priority.insert(ChunkCoord(5, 5), 9);
+    world.explosion_pointer.insert(ChunkCoord(5, 5), vec![0]);
+    world.explosion_data.push((0, 0, ExTarget::Ray(1), 0));
+    world
+        .explosion_heap
+        .push(ExplosionData::new(0, 0, 8, 1, 8, false, false, 0, 100));
+
+    world.reset();
+
+    assert!(
+        world.last_request_priority.is_empty(),
+        "last_request_priority survived reset"
+    );
+    assert!(
+        world.explosion_pointer.is_empty(),
+        "explosion_pointer survived reset"
+    );
+    assert!(
+        world.explosion_data.is_empty(),
+        "explosion_data survived reset"
+    );
+    assert!(
+        world.explosion_heap.is_empty(),
+        "explosion_heap survived reset"
     );
 }
