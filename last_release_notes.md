@@ -1,11 +1,11 @@
-## Noita Entangled Worlds v1.6.9 (helix-dev0 fork)
+## Noita Entangled Worlds v1.7.0 (helix-dev0 fork)
 
-Fixes a slow performance creep where the host — and clients — got laggier the longer a run went on.
+Fixes fire desync — fire one player starts now stays in sync for the other.
 
-### Changes since v1.6.8
-- **No more lag-over-time creep** — the proxy's world-sync layer kept several per-chunk bookkeeping maps (and the deferred-explosion buffers) growing for the entire session: entries were added as you explored but only ever freed on a world/dimension change, never when a chunk unloaded. Over a long run this steady memory growth degraded allocator/cache behaviour and made the game feel progressively laggier — for the host **and** every client. This release frees that per-chunk state the moment a chunk unloads (and when a peer disconnects), clears the buffers a world change had been leaking, and reclaims the explosion buffers once their pending work drains. **Proxy-only, with no wire-format change** — fully interoperable with v1.6.8 / v1.6.7, and it does not affect terrain, sync correctness, or bandwidth.
+### Changes since v1.6.9
+- **Fire stays in sync between players** — fire in Noita is simulated independently on each player's machine, and world sync only re-sent burning chunks on a slow rotating schedule (the chunk you're standing in every ~4 frames, farther ones up to every ~16), so the two simulations drifted apart and one player could see flames the other didn't ("you're standing in fire" when you weren't). Burning chunks are now detected and re-synced **every frame** while they're on fire, cutting the divergence window from ~60–250 ms down to ~16 ms, so both players see essentially the same fire as it spreads and dies. This is a bundled mod + ewext change with **no network-protocol change** — fully interoperable with v1.6.9 and older; both players want v1.7.0 for fire to match.
 
-This is on top of v1.6.8's adaptive remote-player smoothing, v1.6.6's host-side world-sync improvements, v1.6.5's Steam NoNagle + bounded world cuts, and v1.6.4's encode-once fan-out, quinn BBR tuning, TCP_NODELAY, message-length bounding, network instrumentation (`NP_NET_STATS=1`), and build-profile tuning.
+This is on top of v1.6.9's host/client lag-over-time fix, v1.6.8's adaptive remote-player smoothing, and the earlier world-sync, Steam NoNagle, and networking work.
 
 ## Installation
 
