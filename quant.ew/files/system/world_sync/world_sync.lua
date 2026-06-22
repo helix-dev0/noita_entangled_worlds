@@ -21,6 +21,16 @@ local iter_slow = 0
 
 local iter_slow_2 = 0
 
+-- Eager fire re-sync state. Fire is a per-peer cellular simulation; on the normal
+-- ring cadence (up to ~16 frames for far chunks) the two peers' fires diverge and
+-- one player can see flames the other doesn't. A chunk with >= FIRE_THRESHOLD flame
+-- cells is marked "hot" and re-captured every frame (shrinking the divergence window
+-- to ~1 frame) until HOT_TTL frames after its fire drops below the threshold.
+local FIRE_THRESHOLD = 16
+local HOT_TTL = 12
+local MAX_HOT_FLUSH = 24
+local hot_chunks = {} -- "cx,cy" -> { cx = cx, cy = cy, exp = expiry_frame }
+
 --[[local function do_benchmark()
     local world_ffi = require("noitapatcher.nsew.world_ffi")
     local grid_world = world_ffi.get_grid_world()
@@ -55,16 +65,79 @@ local function send_chunks(cx, cy)
     local chx, chy = cx * CHUNK_SIZE, cy * CHUNK_SIZE
     local crect = rect.Rectangle(chx, chy, chx + CHUNK_SIZE, chy + CHUNK_SIZE)
     if DoesWorldExistAt(crect.left, crect.top, crect.right, crect.bottom) then
-        local area = world.encode_area(crect.left, crect.top, crect.right, crect.bottom, encoded_area)
+        local area, fire = world.encode_area(crect.left, crect.top, crect.right, crect.bottom, encoded_area)
         if area ~= nil then
             --if ctx.proxy_opt.debug then
             --     GameCreateSpriteForXFrames("mods/quant.ew/files/resource/debug/box_128x128.png", crect.left+64, crect.top + 64, true, 0, 0, 11, true)
             --end
             local str = ffi.string(area, world.encoded_size(area))
             net.proxy_bin_send(KEY_WORLD_FRAME, str)
+            if fire ~= nil and fire >= FIRE_THRESHOLD then
+                local key = cx .. "," .. cy
+                local h = hot_chunks[key]
+                if h ~= nil then
+                    h.exp = GameGetFrameNum() + HOT_TTL
+                else
+                    hot_chunks[key] = { cx = cx, cy = cy, exp = GameGetFrameNum() + HOT_TTL }
+                end
+            end
         end
     end
 end
+
+-- Re-capture every currently-burning chunk, at its normal distance-based ring
+-- priority (so the eager pass doesn't perturb authority arbitration vs the ring),
+-- emitting one KEY_WORLD_END per distinct priority. Bounded by MAX_HOT_FLUSH.
+local function flush_hot_chunks(ocx, ocy, pos_data, base_pri)
+    local now = GameGetFrameNum()
+    -- First pass: drop expired entries and snapshot the live ones (don't re-capture
+    -- inside pairs() — send_chunks may refresh hot_chunks).
+    local due
+    for key, h in pairs(hot_chunks) do
+        if now >= h.exp then
+            hot_chunks[key] = nil
+        else
+            due = due or {}
+            due[#due + 1] = h
+        end
+    end
+    if due == nil then
+        return
+    end
+    -- Bucket by distance-based priority (matches the ring gradient exactly), capped.
+    local buckets
+    local n = 0
+    for _, h in ipairs(due) do
+        if n >= MAX_HOT_FLUSH then
+            break
+        end
+        n = n + 1
+        local d = math.max(math.abs(h.cx - ocx), math.abs(h.cy - ocy))
+        -- d == 0 is the player's own chunk; mirror the ring's give_0 override (the
+        -- normal branch always calls get_all_chunks with give_0 = true) so a burning
+        -- home chunk keeps priority 0 even for a notplayer (base_pri 16).
+        local pri
+        if d == 0 then
+            pri = 0
+        else
+            pri = math.min(base_pri + math.min(d, 2), 16)
+        end
+        buckets = buckets or {}
+        local b = buckets[pri]
+        if b == nil then
+            b = {}
+            buckets[pri] = b
+        end
+        b[#b + 1] = h
+    end
+    for pri, list in pairs(buckets) do
+        for _, h in ipairs(list) do
+            send_chunks(h.cx, h.cy)
+        end
+        net.proxy_bin_send(KEY_WORLD_END, string.char(pri) .. pos_data)
+    end
+end
+
 local int = 4 -- ctx.proxy_opt.world_sync_interval
 
 local function get_all_chunks(ocx, ocy, pos_data, priority, give_0)
@@ -206,6 +279,9 @@ function world_sync.on_world_update()
         if EntityHasTag(ctx.my_player.entity, "ew_notplayer") then
             pri = 16
         end
+        -- Eager-resync burning chunks before the normal ring pass so fire stays in
+        -- sync between peers (see hot_chunks / flush_hot_chunks above).
+        flush_hot_chunks(ocx, ocy, pos_data, pri)
         get_all_chunks(ocx, ocy, pos_data, pri, true)
     end
 end

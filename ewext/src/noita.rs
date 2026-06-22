@@ -50,13 +50,17 @@ impl ParticleWorldState {
         end_x: i32,
         end_y: i32,
         mut pixel_runs: *mut pixel::NoitaPixelRun,
-    ) -> usize {
+    ) -> (usize, usize) {
         // Allow compiler to generate better code.
         assert_eq!(start_x % 128, 0);
         assert_eq!(start_y % 128, 0);
         assert!((end_x - start_x) <= 128);
         assert!((end_y - start_y) <= 128);
 
+        // Count flame cells so the Lua world-sync layer can eagerly re-sync
+        // burning chunks (fire is a per-peer cellular sim that otherwise diverges
+        // between the ring-cadence pixel snapshots).
+        let mut fire_count = 0usize;
         for y in start_y..end_y {
             for x in start_x..end_x {
                 let mut raw_pixel = pixel::RawPixel {
@@ -66,6 +70,9 @@ impl ParticleWorldState {
                 let cell = self.get_cell_raw(x, y);
                 if let Some(cell) = cell {
                     let cell_type = self.get_cell_type(cell).unwrap_or(ntypes::CellType::None);
+                    if cell_type == ntypes::CellType::Fire {
+                        fire_count += 1;
+                    }
                     match cell_type {
                         ntypes::CellType::None => {}
                         // Nobody knows how box2d pixels work.
@@ -96,6 +103,6 @@ impl ParticleWorldState {
             pixel_runs = unsafe { pixel_runs.offset(1) };
         }
         self.runner.clear();
-        runs
+        (runs, fire_count)
     }
 }
