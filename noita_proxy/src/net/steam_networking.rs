@@ -7,8 +7,8 @@ use steamworks::{
     CallbackHandle, ClientManager, LobbyChatUpdate, LobbyId, LobbyType, SteamError, SteamId,
     networking_sockets::{ListenSocket, NetPollGroup},
     networking_types::{
-        ListenSocketEvent, NetConnectionRealTimeInfo, NetworkingConnectionState,
-        NetworkingIdentity, SendFlags,
+        ListenSocketEvent, NetConnectionRealTimeInfo, NetworkingConfigEntry, NetworkingConfigValue,
+        NetworkingConnectionState, NetworkingIdentity, SendFlags,
     },
 };
 use tangled::{PeerState, Reliability};
@@ -21,6 +21,13 @@ use crate::{
 };
 
 use super::omni::{OmniNetworkEvent, OmniPeerId};
+
+/// Raise Steam's per-connection reliable send buffer above the 512 KiB default
+/// (`k_ESteamNetworkingConfig_SendBufferSize`) so bursts of reliable traffic don't hit
+/// `k_EResultLimitExceeded` and get dropped (see issue #19). Set at connection creation; on the
+/// listen socket it becomes the default for accepted (inbound) connections, and on `connect_p2p`
+/// it covers outbound connections. Local send-tuning only -- no wire change.
+const SEND_BUFFER_SIZE_BYTES: i32 = 4 * 1024 * 1024; // 4 MiB
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectError {
@@ -132,7 +139,13 @@ impl Connections {
         let my_id = client.user().steam_id();
         let networking_sockets = client.networking_sockets();
         let listen_socket = networking_sockets
-            .create_listen_socket_p2p(0, None)
+            .create_listen_socket_p2p(
+                0,
+                Some(NetworkingConfigEntry::new_int32(
+                    NetworkingConfigValue::SendBufferSize,
+                    SEND_BUFFER_SIZE_BYTES,
+                )),
+            )
             .expect("handle to be valid"); // Unclear in what cases this can fail.
         let poll_group = networking_sockets.create_poll_group().into();
         Connections {
@@ -286,7 +299,14 @@ impl Connections {
         } else {
             info!("Initiating connection to {:?}", peer);
             let connection = networking_sockets
-                .connect_p2p(peer_identity, 0, None)
+                .connect_p2p(
+                    peer_identity,
+                    0,
+                    Some(NetworkingConfigEntry::new_int32(
+                        NetworkingConfigValue::SendBufferSize,
+                        SEND_BUFFER_SIZE_BYTES,
+                    )),
+                )
                 .expect("handle to be valid");
             connection.set_poll_group(&self.poll_group.lock().unwrap());
             self.peers
