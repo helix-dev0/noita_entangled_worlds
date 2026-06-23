@@ -80,7 +80,7 @@ local MAX_EXTRAP = 0.15 -- seconds; cap on extrapolation past the newest sample
 -- received sample is then far from the last purely from normal motion across the gap, which made
 -- the remote player appear to teleport. Threshold = base + max_speed * dt.
 local TELEPORT_BASE_PX = 256 -- floor: a jump below this is never treated as a teleport
-local TELEPORT_SPEED_PXPS = 1800 -- max plausible player speed (px/s) used to scale the threshold by gap
+local TELEPORT_SPEED_PXPS = 3000 -- max plausible player speed (px/s, generous for levitation/speed perks); scales the threshold by gap
 
 local player_fns = {
     deserialize_inputs = function(message, player_data)

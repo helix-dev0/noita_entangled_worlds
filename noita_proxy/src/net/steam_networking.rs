@@ -24,9 +24,9 @@ use super::omni::{OmniNetworkEvent, OmniPeerId};
 
 /// Raise Steam's per-connection reliable send buffer above the 512 KiB default
 /// (`k_ESteamNetworkingConfig_SendBufferSize`) so bursts of reliable traffic don't hit
-/// `k_EResultLimitExceeded` and get dropped (see issue #19). Set at connection creation; on the
-/// listen socket it becomes the default for accepted (inbound) connections, and on `connect_p2p`
-/// it covers outbound connections. Local send-tuning only -- no wire change.
+/// `k_EResultLimitExceeded` and get dropped (see issue #19). This sizes OUR outbound send queue on
+/// each connection: set it on the listen socket (the default for connections we accept) and on
+/// `connect_p2p` (connections we initiate), covering every connection. Local-only; no wire change.
 const SEND_BUFFER_SIZE_BYTES: i32 = 4 * 1024 * 1024; // 4 MiB
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
