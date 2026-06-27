@@ -1,11 +1,15 @@
-## Noita Entangled Worlds v1.7.0 (helix-dev0 fork)
+## Noita Entangled Worlds v1.8.0 (helix-dev0 fork)
 
-Fixes fire desync — fire one player starts now stays in sync for the other.
+A netcode reliability + performance pass: fixes a busy-scene desync, entity-sync skips, a late-game crash, and trims host CPU. **No network-protocol change** — interoperable with v1.7.0 — but it updates the bundled mod + ewext, so both players should be on v1.8.0.
 
-### Changes since v1.6.9
-- **Fire stays in sync between players** — fire in Noita is simulated independently on each player's machine, and world sync only re-sent burning chunks on a slow rotating schedule (the chunk you're standing in every ~4 frames, farther ones up to every ~16), so the two simulations drifted apart and one player could see flames the other didn't ("you're standing in fire" when you weren't). Burning chunks are now detected and re-synced **every frame** while they're on fire, cutting the divergence window from ~60–250 ms down to ~16 ms, so both players see essentially the same fire as it spreads and dies. This is a bundled mod + ewext change with **no network-protocol change** — fully interoperable with v1.6.9 and older; both players want v1.7.0 for fire to match.
+### Highlights since v1.7.0
 
-This is on top of v1.6.9's host/client lag-over-time fix, v1.6.8's adaptive remote-player smoothing, and the earlier world-sync, Steam NoNagle, and networking work.
+- **Busy scenes stay in sync.** Under heavy load (big fights, explosions, lots of digging) the proxy used to silently drop reliable sync messages whenever Steam's send queue filled up — things would desync until they happened to re-sync. Reliable messages are now buffered and retried in order instead of dropped; only a genuinely stuck connection escalates to a clean disconnect. (#19)
+- **Entities no longer skip or duplicate over time.** The entity position-sync batcher could skip or double-send entities — and never synced any entity past a certain count at all. Now every tracked entity is synced exactly once per cycle.
+- **Fixes a late-game crash.** A memory-safety bug in ewext (`to_integer_array`) that could corrupt LuaJIT's stack on explosion / level-load frames is fixed. (#16)
+- **Lower host CPU, smoother world sync.** Pixel/world sync now uses a bitset + sparse run-length encoding (skips unchanged regions), bulk pixel fills, reused per-frame buffers, and O(1) entity lookups. Voice chat moved to an unreliable channel (lower latency, less queue pressure). Several previously-fatal error paths now degrade gracefully instead of crashing.
+
+⚠️ These netcode changes are covered by tests + review but are best proven in real play — please report any sync oddities.
 
 ## Installation
 
