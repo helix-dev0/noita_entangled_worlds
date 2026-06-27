@@ -40,6 +40,20 @@ struct EntityEntryPair {
     gid: Gid,
 }
 
+/// Half-open `[start, end)` slice of the per-cycle lid snapshot to process on
+/// the given in-cycle frame index (`frame_num % 60`, so it must be `< 60`).
+/// Over a full 60-frame cycle the returned ranges partition `0..len` exactly:
+/// every index is covered by exactly one frame, with no gaps and no overlap, so
+/// each tracked entity is position-synced exactly once per cycle. (The previous
+/// `(len / 60).max(1)` batch size silently dropped the `len % 60` tail entities
+/// every cycle once `len > 60`, which a stable iteration order would otherwise
+/// turn into permanent starvation of those entities.)
+fn pos_cycle_batch(frame_in_cycle: usize, len: usize) -> (usize, usize) {
+    let start = frame_in_cycle * len / 60;
+    let end = (frame_in_cycle + 1) * len / 60;
+    (start, end)
+}
+
 struct LocalDiffModelTracker {
     tracked: BiHashMap<Lid, EntityID>,
     pending_removal: Vec<Lid>,
@@ -59,6 +73,24 @@ pub(crate) struct LocalDiffModel {
     /// instead of a linear scan. gids are unique per entry, so this is a
     /// bijection; removals are lid-scoped so a stale mapping is never deleted.
     gid_to_lid: FxHashMap<Gid, Lid>,
+    /// Insertion-ordered list of every `Lid` currently present in
+    /// `entity_entries`. `FxHashMap` iteration order is unstable across frames
+    /// (it rehashes on insert/remove), so the time-sliced batchers below drive
+    /// their per-frame slice off this stable Vec instead of `entity_entries`
+    /// directly. Kept consistent with `entity_entries` at EVERY insert and
+    /// remove (push on insert, order-preserving remove on remove). `Lid`s are
+    /// monotonic (never reused) so an entry appears at most once.
+    lid_order: Vec<Lid>,
+    /// Snapshot of `lid_order` taken at the start of the current
+    /// `update_tracked_entities` cycle (when its cursor is at 0). Sliced by the
+    /// time-budget cursor so every tracked entity is visited exactly once per
+    /// cycle even if `lid_order` mutates mid-cycle (removed lids are skipped,
+    /// lids added mid-cycle are picked up by the next cycle's snapshot).
+    update_cycle: Vec<Lid>,
+    /// Snapshot of `lid_order` for the 60-frame `get_pos_data` position cycle,
+    /// refreshed at the cycle boundary (frame % 60 == 0). Same exactly-once
+    /// guarantee as `update_cycle`.
+    pos_cycle: Vec<Lid>,
     tracker: LocalDiffModelTracker,
     upload: FxHashSet<Lid>,
     dont_upload: FxHashSet<Lid>,
@@ -76,6 +108,18 @@ impl LocalDiffModel {
     pub(crate) fn dont_save(&mut self, lid: Lid) {
         self.dont_save.insert(lid);
     }
+    /// Remove `lid` from the insertion-ordered `lid_order` index while keeping
+    /// the order of the remaining entries (an order-preserving remove, NOT
+    /// `swap_remove`, so an in-flight per-cycle cursor can't be made to skip or
+    /// double-visit a neighbour). Must be called at every site that removes
+    /// `lid` from `entity_entries`. Takes the field by `&mut` (rather than
+    /// `&mut self`) so it stays a disjoint borrow usable inside the
+    /// `self.tracker.*.drain(..)` loops that do the removals.
+    fn forget_lid_order(lid_order: &mut Vec<Lid>, lid: Lid) {
+        if let Some(pos) = lid_order.iter().position(|&l| l == lid) {
+            lid_order.remove(pos);
+        }
+    }
     pub(crate) fn got_polied(&mut self, gid: Gid) {
         self.tracker.got_polied(gid);
     }
@@ -87,18 +131,24 @@ impl LocalDiffModel {
         self.tracker.entity_by_lid(lid).ok()
     }
     pub(crate) fn get_pos_data(&mut self, frame_num: usize) -> Vec<UpdateOrUpload> {
-        let len = self.entity_entries.len();
-        let batch_size = (len / 60).max(1);
-        //TODO since i do this in other places, i do more work at the start of the second then the end of the second as len is not equal to a multiple of 60 generally, so this should be spread out
-        let start = (frame_num % 60) * batch_size;
-        let end = (start + batch_size).min(len);
+        let frame_in_cycle = frame_num % 60;
+        // Refresh the per-cycle snapshot of the insertion-ordered lid list at the
+        // cycle boundary (and on first use). Slicing a fixed snapshot — instead
+        // of the live `FxHashMap`, whose iteration order is reshuffled by every
+        // insert/remove — guarantees each tracked entity is visited exactly once
+        // per 60-frame cycle even if entities are added or removed mid-cycle
+        // (added ones join the next cycle's snapshot, removed ones are skipped
+        // by the `get` below).
+        if frame_in_cycle == 0 || self.pos_cycle.is_empty() {
+            self.pos_cycle.clear();
+            self.pos_cycle.extend_from_slice(&self.lid_order);
+        }
+        let (start, end) = pos_cycle_batch(frame_in_cycle, self.pos_cycle.len());
         let mut upload = std::mem::take(&mut self.upload);
-        let mut res: Vec<UpdateOrUpload> = self
-            .entity_entries
+        let mut res: Vec<UpdateOrUpload> = self.pos_cycle[start..end]
             .iter()
-            .skip(start)
-            .take(end - start)
-            .filter_map(|(lid, p)| {
+            .filter_map(|lid| {
+                let p = self.entity_entries.get(lid)?;
                 let EntityEntryPair {
                     current: Some(current),
                     gid,
@@ -233,6 +283,9 @@ impl Default for LocalDiffModel {
             next_lid: Lid(0),
             entity_entries: Default::default(),
             gid_to_lid: Default::default(),
+            lid_order: Vec::new(),
+            update_cycle: Vec::new(),
+            pos_cycle: Vec::new(),
             tracker: LocalDiffModelTracker {
                 tracked: Default::default(),
                 pending_removal: Vec::with_capacity(16),
@@ -972,6 +1025,8 @@ impl LocalDiffModel {
             },
         );
         self.gid_to_lid.insert(gid, lid);
+        // Keep the insertion-ordered batch index consistent with the map.
+        self.lid_order.push(lid);
 
         Ok(lid)
     }
@@ -1146,6 +1201,7 @@ impl LocalDiffModel {
                 if self.gid_to_lid.get(&info.gid) == Some(&lid) {
                     self.gid_to_lid.remove(&info.gid);
                 }
+                Self::forget_lid_order(&mut self.lid_order, lid);
                 to_untrack.push((info.gid, lid));
                 info.current.unwrap().drops_gold
             } else {
@@ -1176,12 +1232,26 @@ impl LocalDiffModel {
         } else {
             self.wait_to_transfer = self.wait_to_transfer.saturating_sub(1)
         }
-        let l = self.entity_entries.len();
+        // Drive the time-sliced cursor off a per-cycle snapshot of the
+        // insertion-ordered lid list rather than `entity_entries.iter()`, whose
+        // order `FxHashMap` reshuffles on every insert/remove. Refreshing the
+        // snapshot only at the cycle boundary (cursor 0) makes a full cycle
+        // visit each tracked entity exactly once even as entities are added or
+        // removed mid-cycle: removed lids are skipped (the `get_mut` below
+        // returns `None`) and lids added mid-cycle are picked up next cycle.
+        if start == 0 {
+            self.update_cycle.clear();
+            self.update_cycle.extend_from_slice(&self.lid_order);
+        }
+        let l = self.update_cycle.len();
         let mut end = 0;
         let start = if start >= l { 0 } else { start };
-        for (i, (&lid, EntityEntryPair { last, current, gid })) in
-            self.entity_entries.iter_mut().skip(start).enumerate()
-        {
+        for idx in start..l {
+            let lid = self.update_cycle[idx];
+            let Some(EntityEntryPair { last, current, gid }) = self.entity_entries.get_mut(&lid)
+            else {
+                continue;
+            };
             match self
                 .tracker
                 .update_entity(
@@ -1396,7 +1466,7 @@ impl LocalDiffModel {
                 }
             }
             if tmr.elapsed().as_micros() > 3000 {
-                end = (start + i + 1) % l;
+                end = (idx + 1) % l;
                 break;
             }
         }
@@ -1409,10 +1479,11 @@ impl LocalDiffModel {
             self.update_buffer.push(EntityUpdate::RemoveEntity(lid));
             // "Untrack" entity
             let ent = self.tracker.tracked.remove_by_left(&lid);
-            if let Some(entry) = self.entity_entries.remove(&lid)
-                && self.gid_to_lid.get(&entry.gid) == Some(&lid)
-            {
-                self.gid_to_lid.remove(&entry.gid);
+            if let Some(entry) = self.entity_entries.remove(&lid) {
+                if self.gid_to_lid.get(&entry.gid) == Some(&lid) {
+                    self.gid_to_lid.remove(&entry.gid);
+                }
+                Self::forget_lid_order(&mut self.lid_order, lid);
             }
             self.upload.remove(&lid);
             self.dont_save.remove(&lid);
@@ -1472,6 +1543,7 @@ impl LocalDiffModel {
                     if self.gid_to_lid.get(&gid) == Some(&lid) {
                         self.gid_to_lid.remove(&gid);
                     }
+                    Self::forget_lid_order(&mut self.lid_order, lid);
                     let _ = net.send(&NoitaOutbound::DesToProxy(
                         shared::des::DesToProxy::DeleteEntity(gid, None),
                     ));
@@ -2766,4 +2838,124 @@ fn sun(entity: &mut EntityManager, counter: u8) -> eyre::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F03: over a full 60-frame cycle the per-frame `[start, end)` ranges from
+    /// `pos_cycle_batch` must form an EXACT partition of `0..len` — every index
+    /// covered exactly once, with no gap (no starved tail) and no overlap (no
+    /// double-send). This is what the unstable `FxHashMap` iteration order plus
+    /// the old `(len / 60).max(1)` batch size broke (the latter dropped the
+    /// `len % 60` tail entities every cycle once `len > 60`).
+    #[test]
+    fn pos_cycle_batch_is_exact_single_cover_per_cycle() {
+        for len in [0usize, 1, 7, 59, 60, 61, 100, 119, 120, 121, 600, 1000] {
+            let mut covered = vec![0u32; len];
+            for f in 0..60 {
+                let (start, end) = pos_cycle_batch(f, len);
+                assert!(start <= end, "len={len} f={f}: start {start} > end {end}");
+                assert!(end <= len, "len={len} f={f}: end {end} > len {len}");
+                for c in covered.iter_mut().take(end).skip(start) {
+                    *c += 1;
+                }
+            }
+            assert!(
+                covered.iter().all(|&c| c == 1),
+                "len={len}: not an exact single cover: {covered:?}"
+            );
+        }
+    }
+
+    /// F03: the time-sliced cursor in `update_tracked_entities` walks the cycle
+    /// snapshot `snapshot[cursor..]` in variable-size chunks (the per-frame time
+    /// budget cuts it at different points), sets `cursor = (last_idx + 1) % len`,
+    /// and a new cycle begins when `cursor` wraps back to 0. Whatever the chunk
+    /// sizes, one cycle must visit every index `0..len` exactly once.
+    #[test]
+    fn time_budget_cursor_covers_snapshot_once_per_cycle() {
+        for len in [1usize, 2, 5, 16, 60, 137] {
+            for &chunk in &[1usize, 3, 7, len] {
+                let chunk = chunk.max(1);
+                let mut covered = vec![0u32; len];
+                let mut cursor = 0usize;
+                loop {
+                    let stop = (cursor + chunk).min(len);
+                    for c in covered.iter_mut().take(stop).skip(cursor) {
+                        *c += 1;
+                    }
+                    cursor = stop % len;
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+                assert!(
+                    covered.iter().all(|&c| c == 1),
+                    "len={len} chunk={chunk}: not an exact single cover: {covered:?}"
+                );
+            }
+        }
+    }
+
+    /// F03: the per-cycle snapshot is what makes coverage robust to mid-cycle
+    /// mutation. A snapshot taken at the cycle boundary must be unaffected by
+    /// later order-preserving mutation of the live `lid_order` (so an in-flight
+    /// cursor can't be made to skip or double-visit a neighbour), while the NEXT
+    /// snapshot reflects the mutation: removed lids gone, lids added mid-cycle
+    /// picked up. Exercises the real `forget_lid_order`.
+    #[test]
+    fn snapshot_isolates_cycle_from_midcycle_mutation() {
+        let mut order: Vec<Lid> = (0..6).map(Lid).collect();
+
+        // Snapshot taken at the start of cycle 1.
+        let snapshot1 = order.clone();
+
+        // Mid-cycle mutation of the LIVE list: order-preserving removes (one
+        // "already visited" near the front, one "not yet visited" near the back)
+        // plus an insert, which appends.
+        LocalDiffModel::forget_lid_order(&mut order, Lid(1));
+        LocalDiffModel::forget_lid_order(&mut order, Lid(4));
+        order.push(Lid(6));
+
+        // The in-flight snapshot is untouched by the live mutation, so walking
+        // it still visits each of its lids exactly once.
+        assert_eq!(
+            snapshot1,
+            vec![Lid(0), Lid(1), Lid(2), Lid(3), Lid(4), Lid(5)]
+        );
+        let mut seen = FxHashSet::default();
+        for &lid in &snapshot1 {
+            assert!(seen.insert(lid), "{lid:?} appears twice in the snapshot");
+        }
+
+        // The live list stayed insertion-ordered through the removals + append.
+        assert_eq!(order, vec![Lid(0), Lid(2), Lid(3), Lid(5), Lid(6)]);
+
+        // The next cycle's snapshot reflects the mutation.
+        let snapshot2 = order.clone();
+        assert!(!snapshot2.contains(&Lid(1)), "removed lid still present");
+        assert!(!snapshot2.contains(&Lid(4)), "removed lid still present");
+        assert!(
+            snapshot2.contains(&Lid(6)),
+            "inserted lid missing next cycle"
+        );
+    }
+
+    /// `forget_lid_order` removes exactly the target lid, preserves the relative
+    /// order of the rest (NOT `swap_remove`), and is a no-op for absent lids.
+    #[test]
+    fn forget_lid_order_is_order_preserving() {
+        let mut order: Vec<Lid> = (0..5).map(Lid).collect();
+        LocalDiffModel::forget_lid_order(&mut order, Lid(2));
+        assert_eq!(order, vec![Lid(0), Lid(1), Lid(3), Lid(4)]);
+        // Absent lid: no-op.
+        LocalDiffModel::forget_lid_order(&mut order, Lid(42));
+        assert_eq!(order, vec![Lid(0), Lid(1), Lid(3), Lid(4)]);
+        // Remove head and tail.
+        LocalDiffModel::forget_lid_order(&mut order, Lid(0));
+        LocalDiffModel::forget_lid_order(&mut order, Lid(4));
+        assert_eq!(order, vec![Lid(1), Lid(3)]);
+    }
 }

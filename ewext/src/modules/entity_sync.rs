@@ -155,7 +155,16 @@ impl EntitySync {
         } else {
             Ok(())
         };
-        if !self.local_diff_model.update_buffer.is_empty() {
+        // Keep updates strictly behind their inits: never send the EntityUpdate
+        // batch on a round whose EntityInit send failed, otherwise a peer could
+        // receive an update for an entity it has not yet been told to create.
+        // (init and update are two separate reliable messages, init first, so
+        // ordering only breaks if the init send fails but the update send
+        // succeeds.) On init-send failure we hold the update buffer untouched —
+        // it is cleared and rebuilt from scratch at the top of the next
+        // `update_tracked_entities`, so nothing the old code delivered is lost —
+        // and surface the init error instead.
+        if err1.is_ok() && !self.local_diff_model.update_buffer.is_empty() {
             let res = std::mem::take(&mut self.local_diff_model.update_buffer);
             let (RemoteDes::EntityUpdate(diff), err) = send_remotedes_ret(
                 ctx,
@@ -171,9 +180,9 @@ impl EntitySync {
                 unreachable!()
             };
             self.local_diff_model.update_buffer = diff;
-            err1?;
             err?;
         }
+        err1?;
         Ok(())
     }
     pub(crate) fn spawn_once(
