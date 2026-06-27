@@ -147,7 +147,14 @@ fn encode_area(lua: LuaState) -> ValuesOnStack {
 
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        let pws = state.particle_world_state.as_mut().unwrap();
+        let Some(pws) = state.particle_world_state.as_mut() else {
+            // Particle world not initialized yet (or already torn down): report
+            // 0 runs / 0 fire instead of panicking across the FFI boundary, which
+            // would abort the Noita process.
+            unsafe { LUA.lua_pushinteger(lua, 0) };
+            unsafe { LUA.lua_pushinteger(lua, 0) };
+            return;
+        };
         let (runs, fire) =
             unsafe { pws.encode_area(start_x, start_y, end_x, end_y, encoded_buffer) };
         unsafe { LUA.lua_pushinteger(lua, runs as isize) };
@@ -224,7 +231,7 @@ fn netmanager_connect(_lua: LuaState) -> eyre::Result<Vec<RawString>> {
 
 fn netmanager_recv(_lua: LuaState) -> eyre::Result<Option<RawString>> {
     let mut binding = try_lock_netmanager()?;
-    let netmanager = binding.as_mut().unwrap();
+    let netmanager = binding.as_mut().ok_or_eyre("Netmanager not available")?;
     while let Some(msg) = netmanager.try_recv()? {
         match msg {
             NoitaInbound::RawMessage(vec) => return Ok(Some(vec.into())),
@@ -266,7 +273,7 @@ fn netmanager_recv(_lua: LuaState) -> eyre::Result<Option<RawString>> {
 fn netmanager_send(lua: LuaState) -> eyre::Result<()> {
     let arg = lua.to_raw_string(1)?;
     let mut binding = try_lock_netmanager()?;
-    let netmanager = binding.as_mut().unwrap();
+    let netmanager = binding.as_mut().ok_or_eyre("Netmanager not available")?;
     netmanager.send(&NoitaOutbound::Raw(arg))?;
 
     Ok(())
@@ -274,7 +281,7 @@ fn netmanager_send(lua: LuaState) -> eyre::Result<()> {
 
 fn netmanager_flush(_lua: LuaState) -> eyre::Result<()> {
     let mut binding = try_lock_netmanager()?;
-    let netmanager = binding.as_mut().unwrap();
+    let netmanager = binding.as_mut().ok_or_eyre("Netmanager not available")?;
     netmanager.flush()
 }
 

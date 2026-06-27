@@ -54,6 +54,11 @@ struct LocalDiffModelTracker {
 pub(crate) struct LocalDiffModel {
     next_lid: Lid,
     entity_entries: FxHashMap<Lid, EntityEntryPair>,
+    /// Reverse index of `entity_entries`: gid -> lid. Kept in sync at every
+    /// insert/remove of `entity_entries` so `find_by_gid` is a hash lookup
+    /// instead of a linear scan. gids are unique per entry, so this is a
+    /// bijection; removals are lid-scoped so a stale mapping is never deleted.
+    gid_to_lid: FxHashMap<Gid, Lid>,
     tracker: LocalDiffModelTracker,
     upload: FxHashSet<Lid>,
     dont_upload: FxHashSet<Lid>,
@@ -78,11 +83,8 @@ impl LocalDiffModel {
         self.entity_entries.iter().any(|(_, e)| e.gid == gid)
     }*/
     pub(crate) fn find_by_gid(&self, gid: Gid) -> Option<EntityID> {
-        self.entity_entries
-            .iter()
-            .find(|(_, e)| e.gid == gid)
-            .map(|e| self.tracker.entity_by_lid(*e.0))?
-            .ok()
+        let lid = *self.gid_to_lid.get(&gid)?;
+        self.tracker.entity_by_lid(lid).ok()
     }
     pub(crate) fn get_pos_data(&mut self, frame_num: usize) -> Vec<UpdateOrUpload> {
         let len = self.entity_entries.len();
@@ -230,6 +232,7 @@ impl Default for LocalDiffModel {
         Self {
             next_lid: Lid(0),
             entity_entries: Default::default(),
+            gid_to_lid: Default::default(),
             tracker: LocalDiffModelTracker {
                 tracked: Default::default(),
                 pending_removal: Vec::with_capacity(16),
@@ -968,6 +971,7 @@ impl LocalDiffModel {
                 gid,
             },
         );
+        self.gid_to_lid.insert(gid, lid);
 
         Ok(lid)
     }
@@ -1139,6 +1143,9 @@ impl LocalDiffModel {
                 continue;
             };
             let drops_gold = if let Some(info) = self.entity_entries.remove(&lid) {
+                if self.gid_to_lid.get(&info.gid) == Some(&lid) {
+                    self.gid_to_lid.remove(&info.gid);
+                }
                 to_untrack.push((info.gid, lid));
                 info.current.unwrap().drops_gold
             } else {
@@ -1402,7 +1409,11 @@ impl LocalDiffModel {
             self.update_buffer.push(EntityUpdate::RemoveEntity(lid));
             // "Untrack" entity
             let ent = self.tracker.tracked.remove_by_left(&lid);
-            self.entity_entries.remove(&lid);
+            if let Some(entry) = self.entity_entries.remove(&lid)
+                && self.gid_to_lid.get(&entry.gid) == Some(&lid)
+            {
+                self.gid_to_lid.remove(&entry.gid);
+            }
             self.upload.remove(&lid);
             self.dont_save.remove(&lid);
             if let Some((_, ent)) = ent {
@@ -1458,6 +1469,9 @@ impl LocalDiffModel {
                 // "Untrack" entity
                 self.tracker.tracked.remove_by_left(&lid);
                 if let Some(gid) = self.entity_entries.remove(&lid).map(|e| e.gid) {
+                    if self.gid_to_lid.get(&gid) == Some(&lid) {
+                        self.gid_to_lid.remove(&gid);
+                    }
                     let _ = net.send(&NoitaOutbound::DesToProxy(
                         shared::des::DesToProxy::DeleteEntity(gid, None),
                     ));

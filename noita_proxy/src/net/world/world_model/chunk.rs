@@ -93,7 +93,7 @@ impl Default for CompactPixel {
 
 pub struct Chunk {
     pixels: [u16; CHUNK_SQUARE],
-    changed: Changed<bool, CHUNK_SQUARE>,
+    changed: Changed<u64, CHANGED_WORDS>,
 }
 
 struct Changed<T: Default, const N: usize>([T; N]);
@@ -109,6 +109,27 @@ impl Changed<u128, CHUNK_SIZE> {
 #[cfg(test)]
 const _: () = assert!(u128::BITS as usize == CHUNK_SIZE);
 const CHUNK_SQUARE: usize = CHUNK_SIZE * CHUNK_SIZE;
+/// Number of `u64` words in the per-pixel "changed" bitset (one bit per pixel).
+const CHANGED_WORDS: usize = CHUNK_SQUARE / u64::BITS as usize;
+const _: () = assert!(CHANGED_WORDS * (u64::BITS as usize) == CHUNK_SQUARE);
+/// Production "changed" tracker: a packed `u64` bitset. The `u128` impl above
+/// and the `bool` impl below are test-only and exist solely to benchmark this
+/// representation (see `test_changed`).
+impl Changed<u64, CHANGED_WORDS> {
+    /// Single-bit read; only the test reference encoder needs it now (production
+    /// reads whole words via `word`), so it is test-only to stay warning-clean.
+    #[cfg(test)]
+    fn get(&self, n: usize) -> bool {
+        self.0[n / 64] & (1 << (n % 64)) != 0
+    }
+    fn set(&mut self, n: usize) {
+        self.0[n / 64] |= 1 << (n % 64)
+    }
+    fn word(&self, word_idx: usize) -> u64 {
+        self.0[word_idx]
+    }
+}
+#[cfg(test)]
 impl Changed<bool, CHUNK_SQUARE> {
     fn get(&self, n: usize) -> bool {
         self.0[n]
@@ -145,7 +166,7 @@ impl Default for Chunk {
     fn default() -> Self {
         Self {
             pixels: [4095; CHUNK_SQUARE],
-            changed: Changed([false; CHUNK_SQUARE]),
+            changed: Changed([0; CHANGED_WORDS]),
         }
     }
 }
@@ -168,13 +189,9 @@ impl Chunk {
         }
     }
 
-    pub fn set_compact_pixel(&mut self, offset: usize, pixel: CompactPixel) {
-        let px = pixel.raw();
-        if self.pixels[offset] != px {
-            self.pixels[offset] = px;
-            self.mark_changed(offset);
-        }
-    }
+    /// Per-pixel changed flag. Only the reference encoder in tests reads
+    /// individual bits now; production code scans whole words via `changed_word`.
+    #[cfg(test)]
     pub fn changed(&self, offset: usize) -> bool {
         self.changed.get(offset)
     }
@@ -184,7 +201,34 @@ impl Chunk {
     }
 
     pub fn clear_changed(&mut self) {
-        self.changed = Changed([false; CHUNK_SQUARE]);
+        self.changed = Changed([0; CHANGED_WORDS]);
+    }
+
+    /// Returns the `word_idx`-th 64-bit word of the per-pixel changed bitset;
+    /// bit `b` corresponds to pixel offset `word_idx * 64 + b`. Lets callers
+    /// skip whole 64-pixel spans that contain no change.
+    pub fn changed_word(&self, word_idx: usize) -> u64 {
+        self.changed.word(word_idx)
+    }
+
+    /// Writes `pixel` to the `len` contiguous offsets starting at `offset`.
+    /// Observably identical to setting each offset individually like `set_pixel`
+    /// (same resulting pixels, and exactly the offsets whose value actually
+    /// changes are marked changed), but performs the write as a single bulk
+    /// slice fill.
+    pub fn fill_compact_pixels(&mut self, offset: usize, len: usize, pixel: CompactPixel) {
+        let px = pixel.raw();
+        let end = offset + len;
+        let mut any_changed = false;
+        for o in offset..end {
+            if self.pixels[o] != px {
+                self.mark_changed(o);
+                any_changed = true;
+            }
+        }
+        if any_changed {
+            self.pixels[offset..end].fill(px);
+        }
     }
 
     pub fn to_chunk_data(&self) -> ChunkData {
