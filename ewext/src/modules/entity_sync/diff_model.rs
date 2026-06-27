@@ -1197,22 +1197,25 @@ impl LocalDiffModel {
             let Some((lid, _)) = self.tracker.tracked.remove_by_right(&killed) else {
                 continue;
             };
-            let drops_gold = if let Some(info) = self.entity_entries.remove(&lid) {
+            let (drops_gold, killed_gid) = if let Some(info) = self.entity_entries.remove(&lid) {
                 if self.gid_to_lid.get(&info.gid) == Some(&lid) {
                     self.gid_to_lid.remove(&info.gid);
                 }
                 Self::forget_lid_order(&mut self.lid_order, lid);
                 to_untrack.push((info.gid, lid));
-                info.current.unwrap().drops_gold
+                (info.current.unwrap().drops_gold, Some(info.gid))
             } else {
-                false
+                (false, None)
             };
             self.update_buffer.push(EntityUpdate::KillEntity {
                 lid,
                 wait_on_kill,
                 responsible_peer,
             });
-            dead.push((pos, SpawnOnce::Enemy(file, drops_gold, responsible_peer)));
+            dead.push((
+                pos,
+                SpawnOnce::Enemy(killed_gid, file, drops_gold, responsible_peer),
+            ));
             self.tracker.global_entities.remove(&killed);
             self.upload.remove(&lid);
             self.dont_save.remove(&lid);
