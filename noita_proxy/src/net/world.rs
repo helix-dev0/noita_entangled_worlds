@@ -172,6 +172,10 @@ impl ChunkState {
         }
     }
 }
+/// `(peers that should receive this chunk's delta, the delta itself)` — the
+/// per-chunk result `chunk_updated_locally` threads into `add_end`.
+type ChunkDeltaTargets = (Vec<(OmniPeerId, u8)>, Option<ChunkDelta>);
+
 // TODO handle exits.
 pub(crate) struct WorldManager {
     pub nice_terraforming: bool,
@@ -207,6 +211,12 @@ pub(crate) struct WorldManager {
     explosion_data: Vec<(usize, usize, ExTarget, u64)>,
     explosion_heap: Vec<ExplosionData>,
     tx: Sender<(ChunkCoord, ChunkData)>,
+    /// Reused per-tick scratch for `add_end`, kept to avoid reallocating these
+    /// buffers on every world-sync frame. Always `.clear()`ed before use; their
+    /// contents never persist across calls.
+    scratch_updated_chunks: Vec<ChunkCoord>,
+    scratch_per_chunk: Vec<ChunkDeltaTargets>,
+    scratch_emit_queue: Vec<(Destination, WorldNetMessage)>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -285,6 +295,9 @@ impl WorldManager {
                     explosion_data: Default::default(),
                     explosion_heap: Default::default(),
                     tx,
+                    scratch_updated_chunks: Vec::new(),
+                    scratch_per_chunk: Vec::new(),
+                    scratch_emit_queue: Vec::new(),
                 },
                 rx,
                 recv2,
@@ -317,6 +330,9 @@ impl WorldManager {
                     explosion_data: Default::default(),
                     explosion_heap: Default::default(),
                     tx: fx,
+                    scratch_updated_chunks: Vec::new(),
+                    scratch_per_chunk: Vec::new(),
+                    scratch_emit_queue: Vec::new(),
                 },
                 rx,
                 recv2,
@@ -338,22 +354,25 @@ impl WorldManager {
     /// `n_peers` is the number of *other* connected peers (excluding self), used
     /// to decide when a chunk can be broadcast once instead of sent per peer.
     pub(crate) fn add_end(&mut self, priority: u8, pos: &[i32], n_peers: usize) {
-        let updated_chunks = self
-            .outbound_model
-            .updated_chunks()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        // Reuse persistent scratch buffers instead of allocating fresh ones each
+        // tick. They're detached via `mem::take`, cleared, refilled identically,
+        // then handed back at the end — so contents/order match the previously
+        // fresh Vecs and behavior is unchanged.
+        let mut updated_chunks = mem::take(&mut self.scratch_updated_chunks);
+        updated_chunks.clear();
+        updated_chunks.extend(self.outbound_model.updated_chunks().iter().copied());
         self.current_update += 1;
         // Compute each changed chunk's RLE delta once. chunk_updated_locally
         // already computes it for authority chunks (to build ListenUpdate), so
         // thread it back here instead of recomputing via get_chunk_delta — a full
         // 16384-pixel scan per chunk that previously ran a second time per frame.
         // Each entry: (peers to send this chunk's delta to, the delta itself).
-        let per_chunk: Vec<_> = updated_chunks
-            .iter()
-            .map(|chunk| self.chunk_updated_locally(*chunk, priority, pos))
-            .collect();
+        let mut per_chunk = mem::take(&mut self.scratch_per_chunk);
+        per_chunk.clear();
+        for chunk in &updated_chunks {
+            let entry = self.chunk_updated_locally(*chunk, priority, pos);
+            per_chunk.push(entry);
+        }
         let mut chunk_packet: FxHashMap<OmniPeerId, Vec<(ChunkDelta, u8)>> = FxHashMap::default();
         // A chunk whose listeners are *every* connected peer is encoded once and
         // broadcast, instead of re-encoded+recompressed per recipient (the
@@ -362,7 +381,7 @@ impl WorldManager {
         // behavior-preserving. Gated to 2+ other peers: with one listener a
         // broadcast saves no encoding and would only add a self-handled copy.
         let mut broadcast_packet: Vec<(ChunkDelta, u8)> = Vec::new();
-        for (who_sending, delta) in per_chunk {
+        for (who_sending, delta) in per_chunk.drain(..) {
             let Some(delta) = delta else {
                 continue;
             };
@@ -377,7 +396,8 @@ impl WorldManager {
                 }
             }
         }
-        let mut emit_queue = Vec::new();
+        let mut emit_queue = mem::take(&mut self.scratch_emit_queue);
+        emit_queue.clear();
         if !broadcast_packet.is_empty() {
             emit_queue.push((
                 Destination::Broadcast,
@@ -392,10 +412,14 @@ impl WorldManager {
                 WorldNetMessage::ChunkPacket { chunkpacket },
             ));
         }
-        for (dst, msg) in emit_queue {
+        for (dst, msg) in emit_queue.drain(..) {
             self.emit_msg(dst, msg)
         }
         self.outbound_model.reset_change_tracking();
+        // Hand the now-empty buffers back for reuse next tick.
+        self.scratch_updated_chunks = updated_chunks;
+        self.scratch_per_chunk = per_chunk;
+        self.scratch_emit_queue = emit_queue;
     }
 
     /// Processes a locally-changed chunk and returns the peers that should
@@ -409,7 +433,7 @@ impl WorldManager {
         chunk: ChunkCoord,
         priority: u8,
         pos: &[i32],
-    ) -> (Vec<(OmniPeerId, u8)>, Option<ChunkDelta>) {
+    ) -> ChunkDeltaTargets {
         if pos.len() == 6 {
             self.my_pos = (pos[0], pos[1]);
             self.cam_pos = (pos[2], pos[3]);
