@@ -73,15 +73,11 @@ impl ChunkData {
         let nil = CompactPixel(NonZeroU16::new(4095).unwrap());
         let mut offset = 0;
         for run in &self.runs {
-            let pixel = run.data;
-            if pixel != nil {
-                for _ in 0..run.length {
-                    chunk.set_compact_pixel(offset, pixel);
-                    offset += 1;
-                }
-            } else {
-                offset += run.length as usize
+            let len = run.length as usize;
+            if run.data != nil {
+                chunk.fill_compact_pixels(offset, len, run.data);
             }
+            offset += len;
         }
     }
     pub(crate) fn apply_delta(&mut self, delta: ChunkData) {
@@ -90,16 +86,43 @@ impl ChunkData {
         self.apply_to_chunk(&mut chunk);
         let mut offset = 0;
         for run in delta.runs.iter() {
+            let len = run.length as usize;
             if run.data != nil {
-                for _ in 0..run.length {
-                    chunk.set_compact_pixel(offset, run.data);
-                    offset += 1;
-                }
-            } else {
-                offset += run.length as usize
+                chunk.fill_compact_pixels(offset, len, run.data);
             }
+            offset += len;
         }
         *self = chunk.to_chunk_data()
+    }
+}
+
+/// Appends `count` copies of `value` to an in-progress run-length encoding,
+/// merging with the current run exactly as `count` sequential
+/// `PixelRunner::put_pixel(value)` calls would (identical run boundaries and
+/// lengths). Lets `get_chunk_delta` bulk-emit whole 64-pixel words of unchanged
+/// pixels without changing the encoded output.
+#[inline]
+fn push_run(
+    runs: &mut Vec<PixelRun<Option<CompactPixel>>>,
+    current: &mut Option<Option<CompactPixel>>,
+    run_len: &mut u32,
+    value: Option<CompactPixel>,
+    count: u32,
+) {
+    match *current {
+        Some(c) if c == value => *run_len += count,
+        Some(c) => {
+            runs.push(PixelRun {
+                length: *run_len,
+                data: c,
+            });
+            *current = Some(value);
+            *run_len = count;
+        }
+        None => {
+            *current = Some(value);
+            *run_len = count;
+        }
     }
 }
 
@@ -218,14 +241,11 @@ impl WorldModel {
         let chunk = self.chunks.entry(delta.chunk_coord).or_default();
         let mut offset = 0;
         for run in delta.runs.iter() {
+            let len = run.length as usize;
             if let Some(pixel) = run.data {
-                for _ in 0..run.length {
-                    chunk.set_compact_pixel(offset, pixel);
-                    offset += 1;
-                }
-            } else {
-                offset += run.length as usize
+                chunk.fill_compact_pixels(offset, len, pixel);
             }
+            offset += len;
         }
     }
 
@@ -235,12 +255,48 @@ impl WorldModel {
         ignore_changed: bool,
     ) -> Option<ChunkDelta> {
         let chunk = self.chunks.get(&chunk_coord)?;
-        let mut runner = PixelRunner::new();
-        for i in 0..CHUNK_SIZE * CHUNK_SIZE {
-            runner.put_pixel((ignore_changed || chunk.changed(i)).then(|| chunk.compact_pixel(i)))
+        // Byte-identical to the previous full `PixelRunner` scan of every pixel:
+        // the per-pixel value sequence is unchanged (`None` for an unchanged
+        // pixel unless `ignore_changed`, otherwise `Some(compact_pixel)`), and
+        // `push_run(v, n)` is exactly `n` `PixelRunner::put_pixel(v)` calls, so
+        // the emitted runs match. The only difference is that a 64-pixel word
+        // with no changed bit is emitted as one bulk `None` run instead of 64
+        // individual pushes — skipping the dominant unchanged span. Proven by
+        // `tests::get_chunk_delta_matches_reference`.
+        const WORDS: usize = (CHUNK_SIZE * CHUNK_SIZE) / 64;
+        let mut runs: Vec<PixelRun<Option<CompactPixel>>> = Vec::new();
+        let mut current: Option<Option<CompactPixel>> = None;
+        let mut run_len: u32 = 0;
+        for w in 0..WORDS {
+            let word = if ignore_changed {
+                u64::MAX
+            } else {
+                chunk.changed_word(w)
+            };
+            if word == 0 {
+                push_run(&mut runs, &mut current, &mut run_len, None, 64);
+            } else {
+                let base = w * 64;
+                for b in 0usize..64 {
+                    let value = if word & (1u64 << b) != 0 {
+                        Some(chunk.compact_pixel(base + b))
+                    } else {
+                        None
+                    };
+                    push_run(&mut runs, &mut current, &mut run_len, value, 1);
+                }
+            }
         }
-        let runs = runner.build().into();
-        Some(ChunkDelta { chunk_coord, runs })
+        if run_len > 0 {
+            runs.push(PixelRun {
+                length: run_len,
+                data: current.expect("has current pixel"),
+            });
+        }
+        Some(ChunkDelta {
+            chunk_coord,
+            runs: Arc::new(runs),
+        })
     }
 
     pub fn updated_chunks(&self) -> &FxHashSet<ChunkCoord> {
@@ -276,5 +332,97 @@ impl WorldModel {
     pub(crate) fn forget_chunk(&mut self, chunk: ChunkCoord) {
         self.chunks.remove(&chunk);
         self.updated_chunks.remove(&chunk);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tiny deterministic PRNG so fuzz inputs are reproducible across runs.
+    struct Xorshift(u64);
+    impl Xorshift {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// The original `PixelRunner`-based delta encoding, kept verbatim as an
+    /// independent reference for the optimized `get_chunk_delta`.
+    fn reference_runs(
+        model: &WorldModel,
+        coord: ChunkCoord,
+        ignore_changed: bool,
+    ) -> Vec<PixelRun<Option<CompactPixel>>> {
+        let chunk = model.chunks.get(&coord).unwrap();
+        let mut runner = PixelRunner::new();
+        for i in 0..CHUNK_SIZE * CHUNK_SIZE {
+            runner.put_pixel((ignore_changed || chunk.changed(i)).then(|| chunk.compact_pixel(i)));
+        }
+        runner.build()
+    }
+
+    // F07 byte-identity guard: the word-skipping `get_chunk_delta` must emit
+    // exactly the same runs (hence the same wire bytes) as the old full scan,
+    // for both `ignore_changed` values, over many random pixel/changed layouts
+    // — including the unchanged-but-non-default case.
+    #[test]
+    fn get_chunk_delta_matches_reference() {
+        let coord = ChunkCoord(3, -2);
+        for seed in 1..=48u64 {
+            let mut rng = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut model = WorldModel::default();
+            {
+                let chunk = model.chunks.entry(coord).or_default();
+                for i in 0..CHUNK_SIZE * CHUNK_SIZE {
+                    if rng.next_u64() & 1 == 0 {
+                        let material = (rng.next_u64() % 512) as u16;
+                        let flags = if rng.next_u64() & 1 == 0 {
+                            PixelFlags::Normal
+                        } else {
+                            PixelFlags::Fluid
+                        };
+                        chunk.set_pixel(i, Pixel { flags, material });
+                    }
+                }
+                // For some seeds, clear the changed bits then dirty a second
+                // sparse subset, leaving non-default pixels that are NOT marked
+                // changed (exercises the unchanged-but-non-default path).
+                if seed.is_multiple_of(3) {
+                    chunk.clear_changed();
+                    for i in 0..CHUNK_SIZE * CHUNK_SIZE {
+                        if rng.next_u64().is_multiple_of(5) {
+                            let material = (rng.next_u64() % 512) as u16;
+                            chunk.set_pixel(
+                                i,
+                                Pixel {
+                                    flags: PixelFlags::Normal,
+                                    material,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            for ignore_changed in [false, true] {
+                let got = model.get_chunk_delta(coord, ignore_changed).unwrap();
+                let want = reference_runs(&model, coord, ignore_changed);
+                assert_eq!(
+                    *got.runs, want,
+                    "runs differ from reference (seed={seed}, ignore_changed={ignore_changed})"
+                );
+                let total: u32 = got.runs.iter().map(|r| r.length).sum();
+                assert_eq!(
+                    total as usize,
+                    CHUNK_SIZE * CHUNK_SIZE,
+                    "run lengths must cover the whole chunk"
+                );
+            }
+        }
     }
 }
