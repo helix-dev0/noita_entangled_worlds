@@ -56,7 +56,13 @@ impl LuaState {
         (1..=len).map(move |i| unsafe {
             LUA.lua_pushinteger(self.lua, i as lua_bindings::lua_Integer);
             LUA.lua_gettable(self.lua, index);
-            LUA.lua_tointeger(self.lua, -1)
+            let value = LUA.lua_tointeger(self.lua, -1);
+            // `lua_gettable` popped the key and pushed the value; pop the value too so
+            // net stack growth per element is zero. Without this each element leaked one
+            // slot, overflowing the Lua C stack on large spawn batches. `index` is an
+            // absolute index, so popping from the top does not shift it.
+            LUA.lua_settop(self.lua, -2);
+            value
         })
     }
 
