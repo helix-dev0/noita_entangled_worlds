@@ -1,10 +1,10 @@
-## Noita Entangled Worlds v1.8.1 (helix-dev0 fork)
+## Noita Entangled Worlds v1.8.2 (helix-dev0 fork)
 
-Adds co-op compatibility for the **Persistence** mod so each player keeps their own profile.
+Fixes a co-op desync where enemies killed by the host could linger as inert "ghosts" on the other player's screen.
 
-### Changes since v1.8.0
+### Changes since v1.8.1
 
-- **Persistence mod profiles are now per-player.** With the [Persistence](https://steamcommunity.com/sharedfiles/filedetails/?id=3253132683) mod, a player joining a co-op lobby had their own saved profile (stashed money, researched spells, wands) replaced by the host's — or wiped to empty — and could overwrite their real save on death. EW's flag-sync no longer routes Persistence's `persistence_`-prefixed data through the host, so each player reads and writes their **own** profile independently. Normal co-op progression sharing (spell/perk unlocks, orbs) is unchanged. Mod-only change — fully interoperable with v1.8.0.
+- **No more ghost enemies.** When the host killed an enemy, a client that had been silently dropped from the host's "interested" set (e.g. on a world/biome transition) never received the removal — it kept a frozen, inert copy of the dead enemy that the host couldn't see. The death broadcast now carries the entity id and removes the client's stale copy. **Wire change — both players must update to v1.8.2** (older versions won't connect).
 
 ## Installation
 
