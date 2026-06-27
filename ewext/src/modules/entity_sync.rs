@@ -205,7 +205,18 @@ impl EntitySync {
                     if pos.contains(x, y, 512 + 256) {
                         let (x, y) = (pos.x as f64, pos.y as f64);
                         match data {
-                            shared::SpawnOnce::Enemy(file, drops_gold, offending_peer) => {
+                            shared::SpawnOnce::Enemy(gid, file, drops_gold, offending_peer) => {
+                                // The host declared this entity dead. If we still
+                                // hold a live puppet of it (e.g. we were silently
+                                // dropped from the host's interest set on a world
+                                // transition, so the KillEntity never reached us),
+                                // remove it now — otherwise it lingers as a frozen
+                                // "ghost" enemy. Mirrors the ChestOpen handler.
+                                if let Some(gid) = gid
+                                    && let Some(ent) = self.find_by_gid(*gid)
+                                {
+                                    ent.kill();
+                                }
                                 if let Ok(entity) = EntityID::load(file, Some(x), Some(y)) {
                                     entity.add_tag("ew_no_enemy_sync")?;
                                     diff_model::init_remote_entity(
