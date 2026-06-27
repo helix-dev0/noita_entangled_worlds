@@ -1,15 +1,10 @@
-## Noita Entangled Worlds v1.8.0 (helix-dev0 fork)
+## Noita Entangled Worlds v1.8.1 (helix-dev0 fork)
 
-A netcode reliability + performance pass: fixes a busy-scene desync, entity-sync skips, a late-game crash, and trims host CPU. **No network-protocol change** — interoperable with v1.7.0 — but it updates the bundled mod + ewext, so both players should be on v1.8.0.
+Adds co-op compatibility for the **Persistence** mod so each player keeps their own profile.
 
-### Highlights since v1.7.0
+### Changes since v1.8.0
 
-- **Busy scenes stay in sync.** Under heavy load (big fights, explosions, lots of digging) the proxy used to silently drop reliable sync messages whenever Steam's send queue filled up — things would desync until they happened to re-sync. Reliable messages are now buffered and retried in order instead of dropped; only a genuinely stuck connection escalates to a clean disconnect. (#19)
-- **Entities no longer skip or duplicate over time.** The entity position-sync batcher could skip or double-send entities — and never synced any entity past a certain count at all. Now every tracked entity is synced exactly once per cycle.
-- **Fixes a late-game crash.** A memory-safety bug in ewext (`to_integer_array`) that could corrupt LuaJIT's stack on explosion / level-load frames is fixed. (#16)
-- **Lower host CPU, smoother world sync.** Pixel/world sync now uses a bitset + sparse run-length encoding (skips unchanged regions), bulk pixel fills, reused per-frame buffers, and O(1) entity lookups. Voice chat moved to an unreliable channel (lower latency, less queue pressure). Several previously-fatal error paths now degrade gracefully instead of crashing.
-
-⚠️ These netcode changes are covered by tests + review but are best proven in real play — please report any sync oddities.
+- **Persistence mod profiles are now per-player.** With the [Persistence](https://steamcommunity.com/sharedfiles/filedetails/?id=3253132683) mod, a player joining a co-op lobby had their own saved profile (stashed money, researched spells, wands) replaced by the host's — or wiped to empty — and could overwrite their real save on death. EW's flag-sync no longer routes Persistence's `persistence_`-prefixed data through the host, so each player reads and writes their **own** profile independently. Normal co-op progression sharing (spell/perk unlocks, orbs) is unchanged. Mod-only change — fully interoperable with v1.8.0.
 
 ## Installation
 
