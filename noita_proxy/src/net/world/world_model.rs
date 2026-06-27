@@ -425,4 +425,84 @@ mod tests {
             }
         }
     }
+
+    /// Sparse-delta encode benchmark — proves F06 (u64 changed-bitset) + F07
+    /// (word-skipping `get_chunk_delta`) speed up the common "few pixels changed
+    /// per frame" case versus the preserved full-pixel `PixelRunner` scan
+    /// (`reference_runs`, the pre-optimization path). Measurement only.
+    ///   cargo test --manifest-path noita_proxy/Cargo.toml --lib \
+    ///       test_sparse_delta_perf -- --nocapture
+    #[test]
+    fn test_sparse_delta_perf() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const TOTAL: usize = CHUNK_SIZE * CHUNK_SIZE; // 16384 px / 256 u64 words
+        let coord = ChunkCoord(0, 0);
+
+        // Write `n` changed pixels (Normal + a small non-default material always
+        // differs from the 4095 default, so each set marks its changed bit),
+        // placed every `stride` offsets. stride==1 = a contiguous local edit
+        // (F07 best case: only ceil(n/64) words non-empty); stride==TOTAL/n =
+        // spread across the chunk (the conservative case).
+        fn build(coord: ChunkCoord, n: usize, stride: usize) -> WorldModel {
+            let mut model = WorldModel::default();
+            let chunk = model.chunks.entry(coord).or_default();
+            for k in 0..n {
+                let i = (k * stride) % TOTAL;
+                chunk.set_pixel(
+                    i,
+                    Pixel {
+                        flags: PixelFlags::Normal,
+                        material: ((k % 511) + 1) as u16,
+                    },
+                );
+            }
+            model
+        }
+        // 64-px words F07 cannot skip = the work the sparse path actually does.
+        fn nonempty_words(model: &WorldModel, coord: ChunkCoord) -> usize {
+            let chunk = model.chunks.get(&coord).unwrap();
+            (0..TOTAL / 64)
+                .filter(|&w| chunk.changed_word(w) != 0)
+                .count()
+        }
+
+        let iters: u128 = 4096;
+        let bench = |model: &WorldModel| {
+            let t = Instant::now();
+            for _ in 0..iters {
+                black_box(model.get_chunk_delta(coord, black_box(false)));
+            }
+            let sparse = t.elapsed().as_nanos() / iters;
+            let t = Instant::now();
+            for _ in 0..iters {
+                black_box(reference_runs(model, coord, black_box(false)));
+            }
+            let reference = t.elapsed().as_nanos() / iters;
+            (sparse, reference)
+        };
+
+        println!("sparse get_chunk_delta vs full-scan reference ({iters} iters, debug):");
+        for pct in [1usize, 10, 100] {
+            let n = TOTAL * pct / 100;
+            let model = build(coord, n, 1); // contiguous = localized edit
+            let (sparse, reference) = bench(&model);
+            println!(
+                "  {pct:>3}% ({n:>5} px, {:>3}/256 words): sparse {sparse:>7} ns | reference {reference:>7} ns | {:>5.1}x",
+                nonempty_words(&model, coord),
+                reference as f64 / sparse.max(1) as f64,
+            );
+        }
+
+        // Conservative cross-check: 1% spread across the whole chunk.
+        let n = TOTAL / 100;
+        let model = build(coord, n, TOTAL / n.max(1));
+        let (sparse, reference) = bench(&model);
+        println!(
+            "  1% spread ({:>3}/256 words): sparse {sparse:>7} ns | reference {reference:>7} ns | {:>5.1}x",
+            nonempty_words(&model, coord),
+            reference as f64 / sparse.max(1) as f64,
+        );
+    }
 }
