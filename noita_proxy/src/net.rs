@@ -4,13 +4,13 @@ use des::DesManager;
 use image::DynamicImage::ImageRgba8;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use messages::{MessageRequest, NetMsg};
-use omni::OmniPeerId;
+use omni::{NetSendError, OmniPeerId};
 use proxy_opt::ProxyOpt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use shared::message_socket::MessageSocket;
 use shared::{Destination, NoitaInbound, NoitaOutbound, RemoteMessage, WorldPos};
 use socket2::{Domain, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, create_dir, remove_dir_all};
 use std::io::Write;
 use std::path::PathBuf;
@@ -216,6 +216,68 @@ pub struct NetManagerInit {
     pub noita_port: u16,
 }
 
+/// Per-peer cap on buffered reliable bytes awaiting a retry after Steam reported
+/// a full send queue (issue #19). This is a SECOND layer on top of Steam's own
+/// 4 MiB `SendBufferSize`: it absorbs transient bursts so reliable sync isn't
+/// dropped. If a peer stays backed up past this, its connection is effectively
+/// dead and we escalate to an explicit disconnect rather than buffer without
+/// bound or silently drop reliable sync. Tune from live testing.
+const MAX_RETRY_BUFFER_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+/// Companion message-count cap for the retry buffer (guards against many tiny
+/// messages slipping under the byte cap).
+const MAX_RETRY_BUFFER_MSGS: usize = 16 * 1024;
+
+/// A bounded, ordered backlog of already-encoded RELIABLE messages for one peer
+/// that Steam refused with `QueueFull`. Drained front-first (FIFO) so reliable
+/// ordering is preserved. `bytes` tracks the queued payload size so the cap can
+/// be enforced in O(1).
+#[derive(Default)]
+struct PeerRetryBuffer {
+    queue: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+/// Append one encoded reliable message to a peer's retry buffer, enforcing the
+/// bound. Returns `true` if the buffer is over its cap (caller must escalate to
+/// a disconnect) — in that case the message is NOT stored. An empty buffer
+/// always accepts at least one message, so a single legitimately-large message
+/// (bounded elsewhere by `MAX_MESSAGE_LEN`) never spuriously trips the cap; we
+/// only escalate once a backlog has genuinely accumulated.
+fn push_retry(buf: &mut PeerRetryBuffer, encoded: &[u8]) -> bool {
+    if !buf.queue.is_empty()
+        && (buf.queue.len() >= MAX_RETRY_BUFFER_MSGS
+            || buf.bytes.saturating_add(encoded.len()) > MAX_RETRY_BUFFER_BYTES)
+    {
+        return true;
+    }
+    buf.bytes += encoded.len();
+    buf.queue.push_back(encoded.to_vec());
+    false
+}
+
+/// Drain `buf` front-first using `send`, stopping at the first message the
+/// transport still can't accept (`QueueFull`) so reliable ORDER is preserved
+/// across ticks. Non-`QueueFull` errors mean the message can't be delivered to
+/// this peer at all, so it's dropped and draining continues (matching the
+/// pre-existing drop-on-error behavior of the direct send path). Factored out
+/// as a free function so the ordering logic is unit-testable without a live
+/// transport.
+fn drain_buffer<F>(buf: &mut PeerRetryBuffer, mut send: F)
+where
+    F: FnMut(&[u8]) -> Result<(), NetSendError>,
+{
+    while !buf.queue.is_empty() {
+        match send(buf.queue[0].as_slice()) {
+            Ok(()) | Err(NetSendError::Other(_)) => {
+                if let Some(sent) = buf.queue.pop_front() {
+                    buf.bytes -= sent.len();
+                }
+            }
+            Err(NetSendError::QueueFull) => break,
+        }
+    }
+}
+
 pub struct NetManager {
     pub peer: omni::PeerVariant,
     pub pending_settings: Mutex<GameSettings>,
@@ -259,6 +321,9 @@ pub struct NetManager {
     pub reset_map: AtomicBool,
     colors: Mutex<FxHashMap<u16, u32>>,
     net_stats: net_stats::NetStats,
+    /// Per-peer bounded backlog of reliable messages that hit a full Steam send
+    /// queue, awaiting retry (issue #19). Empty in the common case.
+    retry_buffers: Mutex<FxHashMap<OmniPeerId, PeerRetryBuffer>>,
 }
 
 impl NetManager {
@@ -302,6 +367,7 @@ impl NetManager {
             no_chunkmap: AtomicBool::new(true),
             colors: Default::default(),
             net_stats: net_stats::NetStats::new(),
+            retry_buffers: Default::default(),
         }
         .into()
     }
@@ -319,23 +385,13 @@ impl NetManager {
         if peer == self.peer.my_id() {
             // Shortcut for sending stuff to myself
             let _ = self.loopback_channel.0.send(msg.clone());
-        } else {
-            let raw = bitcode::encode(msg);
-            let encoded = lz4_flex::compress_prepend_size(&raw);
-            self.net_stats
-                .record_outbound(msg, raw.len(), encoded.len());
-            let len = encoded.len();
-            if let Err(err) = self.peer.send(peer, encoded, reliability) {
-                if cfg!(debug_assertions) {
-                    warn!(
-                        "Error while sending message of len {}: {} {:?}",
-                        len, err, msg
-                    )
-                } else {
-                    warn!("Error while sending message of len {}: {}", len, err)
-                }
-            }
+            return;
         }
+        let raw = bitcode::encode(msg);
+        let encoded = lz4_flex::compress_prepend_size(&raw);
+        self.net_stats
+            .record_outbound(msg, raw.len(), encoded.len());
+        self.dispatch_encoded(peer, &encoded, reliability);
     }
 
     pub(crate) fn broadcast(&self, msg: &NetMsg, reliability: Reliability) {
@@ -343,17 +399,22 @@ impl NetManager {
         let encoded = lz4_flex::compress_prepend_size(&raw);
         self.net_stats
             .record_outbound(msg, raw.len(), encoded.len());
-        let len = encoded.len();
-        if let Err(err) = self.peer.broadcast(encoded, reliability) {
-            warn!("Error while broadcasting message of len {}: {}", len, err)
+        // Fan out per peer through the same chokepoint as `send`/`send_many` so
+        // reliable backpressure (issue #19) is handled uniformly and per-peer
+        // reliable ORDER holds across all three send paths.
+        let my_id = self.peer.my_id();
+        for peer in self.peer.iter_peer_ids() {
+            if peer == my_id {
+                continue;
+            }
+            self.dispatch_encoded(peer, &encoded, reliability);
         }
     }
 
     /// Encode `msg` once and fan it out to `peers`. Re-encoding and
     /// recompressing per recipient is the dominant cost on this path, so we pay
-    /// it once and reuse the bytes (tangled copies the buffer per peer, Steam
-    /// reuses the slice). Our own id goes through the loopback channel, matching
-    /// `send`.
+    /// it once and reuse the bytes. Our own id goes through the loopback
+    /// channel, matching `send`.
     pub(crate) fn send_many(&self, peers: &[OmniPeerId], msg: &NetMsg, reliability: Reliability) {
         match peers {
             [] => {}
@@ -368,16 +429,121 @@ impl NetManager {
                     }
                     self.net_stats
                         .record_outbound(msg, raw.len(), encoded.len());
-                    if let Err(err) = self.peer.send_encoded(peer, &encoded, reliability) {
-                        warn!(
-                            "Error while sending message of len {}: {}",
-                            encoded.len(),
-                            err
-                        );
-                    }
+                    self.dispatch_encoded(peer, &encoded, reliability);
                 }
             }
         }
+    }
+
+    /// Single per-peer send chokepoint with reliable backpressure handling
+    /// (issue #19).
+    ///
+    /// Unreliable messages are best-effort: sent once and dropped on any error
+    /// (including a full queue) — they are loss-tolerant.
+    ///
+    /// A reliable message must never be silently dropped on a full Steam send
+    /// queue. To preserve per-peer reliable ORDER, once a peer has bytes waiting
+    /// in its retry buffer every further reliable send to it is appended behind
+    /// them rather than racing onto the wire; a fresh reliable send is tried on
+    /// the wire immediately and only a `QueueFull` result moves it into the
+    /// buffer. If the bounded buffer overflows we escalate to an explicit
+    /// disconnect of that peer instead of growing without bound or dropping sync.
+    ///
+    /// Ordering scope: per-peer order is guaranteed on the buffered/backpressure
+    /// path and on the single-threaded main-loop send path. Concurrent reliable
+    /// sends to the *same* peer from different threads race exactly as they did
+    /// before this change.
+    fn dispatch_encoded(&self, peer: OmniPeerId, encoded: &[u8], reliability: Reliability) {
+        if reliability != Reliability::Reliable {
+            if let Err(err) = self.peer.send_encoded(peer, encoded, reliability)
+                && !matches!(err, NetSendError::QueueFull)
+            {
+                warn!(
+                    "Error while sending unreliable message of len {} to {peer}: {err}",
+                    encoded.len()
+                );
+            }
+            return;
+        }
+
+        // Reliable: if this peer is already backed up, preserve order by
+        // appending behind the existing bytes instead of trying the wire.
+        // `Some(overflow)` => we appended (and whether that overflowed the cap);
+        // `None` => no existing backlog, fall through to a wire attempt.
+        let appended = {
+            let mut buffers = self.retry_buffers.lock().unwrap();
+            match buffers.get_mut(&peer) {
+                Some(buf) if !buf.queue.is_empty() => Some(push_retry(buf, encoded)),
+                _ => None,
+            }
+        };
+        match appended {
+            Some(true) => {
+                self.escalate_disconnect(peer);
+                return;
+            }
+            Some(false) => return,
+            None => {}
+        }
+
+        // No backlog for this peer: try the wire first.
+        match self.peer.send_encoded(peer, encoded, reliability) {
+            Ok(()) => {}
+            Err(NetSendError::Other(err)) => {
+                warn!(
+                    "Error while sending message of len {} to {peer}: {err}",
+                    encoded.len()
+                );
+            }
+            Err(NetSendError::QueueFull) => {
+                let overflow = {
+                    let mut buffers = self.retry_buffers.lock().unwrap();
+                    push_retry(buffers.entry(peer).or_default(), encoded)
+                };
+                if overflow {
+                    self.escalate_disconnect(peer);
+                }
+            }
+        }
+    }
+
+    /// Flush buffered reliable messages (issue #19) that previously hit a full
+    /// Steam send queue. Called once per main-loop tick after `recv()` has
+    /// polled the socket and freed send-buffer space. Drains each peer
+    /// FRONT-FIRST and stops at the first message still rejected, preserving
+    /// per-peer reliable order.
+    fn drain_retry_buffers(&self) {
+        let mut buffers = self.retry_buffers.lock().unwrap();
+        if buffers.is_empty() {
+            return;
+        }
+        for (&peer, buf) in buffers.iter_mut() {
+            drain_buffer(buf, |bytes| {
+                let r = self.peer.send_encoded(peer, bytes, Reliability::Reliable);
+                if let Err(NetSendError::Other(err)) = &r {
+                    warn!(
+                        "Dropping undeliverable buffered message to {peer} (len {}): {err}",
+                        bytes.len()
+                    );
+                }
+                r
+            });
+        }
+        buffers.retain(|_, buf| !buf.queue.is_empty());
+    }
+
+    /// Explicit, surfaced escalation when a peer's reliable retry buffer
+    /// overflows: drop its (now useless) backlog and force-disconnect it through
+    /// the normal peer-disconnect path. Better an observable disconnect + resync
+    /// than unbounded memory growth or silent desync (issue #19).
+    fn escalate_disconnect(&self, peer: OmniPeerId) {
+        error!(
+            "Reliable send queue to {peer} exceeded the retry-buffer cap ({} bytes / {} msgs); \
+             disconnecting that peer to avoid unbounded memory growth and silent desync (issue #19).",
+            MAX_RETRY_BUFFER_BYTES, MAX_RETRY_BUFFER_MSGS
+        );
+        self.retry_buffers.lock().unwrap().remove(&peer);
+        self.peer.disconnect_peer(peer);
     }
 
     fn clean_dir(path: PathBuf) {
@@ -596,6 +762,10 @@ impl NetManager {
                     &sendm,
                 );
             }
+            // recv() above polled the socket and freed Steam send-buffer space,
+            // so this is the moment to flush any reliable messages we had to
+            // buffer earlier on a full queue (issue #19), front-first per peer.
+            self.drain_retry_buffers();
             for net_msg in self.loopback_channel.1.try_iter() {
                 self.clone().handle_net_msg(
                     &mut state,
@@ -681,10 +851,15 @@ impl NetManager {
                         y,
                         audio.global_input_volume,
                     );
+                    // Voice is opus and loss-tolerant: each AudioData message is
+                    // decoded standalone (no inter-frame dependency), so sending
+                    // it Reliable only added bufferbloat + reliable-queue pressure
+                    // (issue #19 / F26). Route it Unreliable. Wire bytes are
+                    // unchanged — only the transport reliability flag differs.
                     if audio.loopback {
-                        self.send(self.peer.my_id(), &data, Reliability::Reliable)
+                        self.send(self.peer.my_id(), &data, Reliability::Unreliable)
                     }
-                    self.broadcast(&data, Reliability::Reliable);
+                    self.broadcast(&data, Reliability::Unreliable);
                 }
             }
             let mut map = FxHashMap::default();
@@ -784,6 +959,9 @@ impl NetManager {
                 state.try_ms_write(&NoitaInbound::ProxyToDes(ProxyToDes::RemoveEntities(
                     id.into(),
                 )));
+                // Drop any reliable retry backlog for the gone peer so it can't
+                // linger (issue #19).
+                self.retry_buffers.lock().unwrap().remove(&id);
                 if id == self.peer.host_id() {
                     self.back_out.store(true, Ordering::Relaxed)
                 }
@@ -1373,11 +1551,19 @@ impl NetManager {
                     self.player_pos.0.store(x, Ordering::Relaxed);
                     self.player_pos.1.store(y, Ordering::Relaxed);
                     self.broadcast(&NetMsg::PlayerPosition(x, y, b, d), Reliability::Reliable);
-                    self.send(
-                        self.peer.my_id(),
-                        &NetMsg::PlayerPosition(x, y, b, d),
-                        Reliability::Reliable,
-                    );
+                    // Update our own indicator directly instead of round-tripping
+                    // a reliable self-send through the loopback channel (issue #19
+                    // PlayerPosition): this is the exact mutation the
+                    // `NetMsg::PlayerPosition` handler performs for `src == my_id`.
+                    self.players_sprite
+                        .lock()
+                        .unwrap()
+                        .entry(self.peer.my_id())
+                        .and_modify(|(w, is_dead, does_exist, _)| {
+                            *w = Some(WorldPos::from((x, y)));
+                            *is_dead = b;
+                            *does_exist = d;
+                        });
                 }
                 let x: Option<u8> = msg.next().and_then(|s| s.parse().ok());
                 self.push_to_talk.store(x == Some(1), Ordering::Relaxed);
@@ -1693,5 +1879,82 @@ impl Drop for NetInnerState {
             self.world.save_state.save(&self.flags);
             info!("Saved flag info");
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn drain_is_fifo_and_stops_at_first_full() {
+        let mut buf = PeerRetryBuffer::default();
+        for m in [&b"a"[..], &b"bb"[..], &b"ccc"[..]] {
+            assert!(!push_retry(&mut buf, m));
+        }
+        assert_eq!(buf.queue.len(), 3);
+        assert_eq!(buf.bytes, 6);
+
+        // Transport accepts the first two, then reports the queue full again.
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        let mut budget = 2usize;
+        drain_buffer(&mut buf, |bytes| {
+            if budget == 0 {
+                return Err(NetSendError::QueueFull);
+            }
+            budget -= 1;
+            sent.push(bytes.to_vec());
+            Ok(())
+        });
+
+        // FIFO order preserved; the unsent tail stays buffered with its front
+        // intact for the next tick, and byte accounting tracks the removals.
+        assert_eq!(sent, vec![b"a".to_vec(), b"bb".to_vec()]);
+        assert_eq!(buf.queue.len(), 1);
+        assert_eq!(buf.queue.front().unwrap().as_slice(), &b"ccc"[..]);
+        assert_eq!(buf.bytes, 3);
+    }
+
+    #[test]
+    fn drain_drops_undeliverable_and_continues() {
+        let mut buf = PeerRetryBuffer::default();
+        for m in [&b"a"[..], &b"bb"[..], &b"ccc"[..]] {
+            assert!(!push_retry(&mut buf, m));
+        }
+        // A non-QueueFull error means the message can't reach this peer at all:
+        // drop it and keep draining (matches the old direct-send behavior).
+        drain_buffer(&mut buf, |_bytes| {
+            Err(NetSendError::Other(tangled::NetError::Disconnected))
+        });
+        assert!(buf.queue.is_empty());
+        assert_eq!(buf.bytes, 0);
+    }
+
+    #[test]
+    fn push_retry_enforces_msg_cap() {
+        let mut buf = PeerRetryBuffer::default();
+        for _ in 0..MAX_RETRY_BUFFER_MSGS {
+            assert!(!push_retry(&mut buf, b"x"));
+        }
+        assert_eq!(buf.queue.len(), MAX_RETRY_BUFFER_MSGS);
+        // At cap -> the next reliable message overflows (signal escalation) and
+        // is NOT stored: never silently grown, never silently dropped.
+        assert!(push_retry(&mut buf, b"x"));
+        assert_eq!(buf.queue.len(), MAX_RETRY_BUFFER_MSGS);
+    }
+
+    #[test]
+    fn push_retry_always_accepts_first_then_enforces_byte_cap() {
+        let mut buf = PeerRetryBuffer::default();
+        // A single message over the byte cap is still accepted into an empty
+        // buffer (a legitimately-large message is bounded elsewhere by
+        // MAX_MESSAGE_LEN); we only escalate once a backlog has accumulated.
+        let big = vec![0u8; MAX_RETRY_BUFFER_BYTES + 1];
+        assert!(!push_retry(&mut buf, &big));
+        assert_eq!(buf.queue.len(), 1);
+        // Now non-empty and already past the byte cap -> next push escalates.
+        assert!(push_retry(&mut buf, b"y"));
+        assert_eq!(buf.queue.len(), 1);
+        assert_eq!(buf.bytes, MAX_RETRY_BUFFER_BYTES + 1);
     }
 }

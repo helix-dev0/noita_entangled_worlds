@@ -500,16 +500,15 @@ impl SteamPeer {
         self.connections.send_message(peer, send_type, msg)
     }
 
-    pub fn broadcast_message(&self, msg: &[u8], reliability: Reliability) {
-        let peers = self.inner.lock().unwrap().remote_peers.clone();
-        for peer in peers {
-            if let Err(err) = self.send_message(peer, msg, reliability) {
-                warn!(
-                    "Couldn't send a packet to {:?}, st {:?}, err {}",
-                    peer, reliability, err
-                )
-            };
-        }
+    /// Tear down our connection to `peer` and surface a `PeerDisconnected`
+    /// event through the existing lobby-disconnect path, so the proxy runs its
+    /// normal peer-left cleanup. Used by the issue #19 backpressure escalation
+    /// when a peer's reliable retry buffer overflows.
+    pub fn disconnect_peer(&self, peer: OmniPeerId) {
+        let steam_id: SteamId = peer.into();
+        self.sender
+            .send(SteamEvent::PeerDisconnectedFromLobby(steam_id))
+            .ok();
     }
 
     pub fn recv(&self) -> Vec<OmniNetworkEvent> {
