@@ -170,6 +170,26 @@ impl PeerVariant {
         }
     }
 
+    /// Count connected peers whose id is not `exclude`, without collecting the
+    /// peer ids into a `Vec`. Equivalent to
+    /// `self.iter_peer_ids().into_iter().filter(|p| *p != exclude).count()` but
+    /// avoids the intermediate allocation on the per-frame hot path. The Tangled
+    /// backend iterates lazily; the Steam backend still briefly clones its peer
+    /// set inside `get_peer_ids`, exactly as `iter_peer_ids` does.
+    pub fn count_peer_ids_excluding(&self, exclude: OmniPeerId) -> usize {
+        match self {
+            PeerVariant::Tangled(p) => p
+                .iter_peer_ids()
+                .filter(|id| OmniPeerId::from(*id) != exclude)
+                .count(),
+            PeerVariant::Steam(p) => p
+                .get_peer_ids()
+                .into_iter()
+                .filter(|id| OmniPeerId::from(*id) != exclude)
+                .count(),
+        }
+    }
+
     pub(crate) fn recv(&self) -> Vec<OmniNetworkEvent> {
         match self {
             PeerVariant::Tangled(p) => p.recv().map(OmniNetworkEvent::from).collect(),

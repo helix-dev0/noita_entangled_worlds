@@ -73,6 +73,29 @@ pub(crate) fn ws_encode_mod(peer: OmniPeerId, data: &[u8]) -> NoitaInbound {
     NoitaInbound::RawMessage(buf)
 }
 
+/// Upper bound on the decompressed size we will allocate for an inbound lz4
+/// message. The size prefix is peer-controlled, so without a cap a hostile
+/// in-lobby peer could declare a ~4 GiB length and force an unbounded
+/// allocation (OOM/DoS). Generous: real messages are orders of magnitude
+/// smaller, so legitimate traffic is unaffected.
+const MAX_MESSAGE_LEN: usize = 256 * 1024 * 1024;
+
+/// Like [`lz4_flex::decompress_size_prepended`], but rejects inputs whose
+/// declared uncompressed size exceeds [`MAX_MESSAGE_LEN`] *before* allocating.
+///
+/// `compress_prepend_size` (and thus `decompress_size_prepended`) stores the
+/// uncompressed length as a leading little-endian `u32`; we read that same
+/// prefix and bail out without allocating when it is implausibly large. Both
+/// existing call sites already discard the decompress error (`.ok()` / `if let
+/// Ok`), so returning `None` here is behavior-preserving for them.
+fn decompress_size_prepended_capped(data: &[u8]) -> Option<Vec<u8>> {
+    let declared_len = u32::from_le_bytes(data.get(0..4)?.try_into().ok()?) as usize;
+    if declared_len > MAX_MESSAGE_LEN {
+        return None;
+    }
+    lz4_flex::decompress_size_prepended(data).ok()
+}
+
 #[derive(Encode, Decode)]
 pub(crate) struct RunInfo {
     pub(crate) seed: u64,
@@ -766,9 +789,8 @@ impl NetManager {
                 }
             }
             omni::OmniNetworkEvent::Message { src, data } => {
-                let Some((net_msg, raw_len)) = lz4_flex::decompress_size_prepended(&data)
-                    .ok()
-                    .and_then(|decomp| {
+                let Some((net_msg, raw_len)) =
+                    decompress_size_prepended_capped(&data).and_then(|decomp| {
                         Some((bitcode::decode::<NetMsg>(&decomp).ok()?, decomp.len()))
                     })
                 else {
@@ -862,7 +884,7 @@ impl NetManager {
                 state.try_ms_write(&ws_encode_mod(src, &data));
             }
             NetMsg::ModCompressed { data } => {
-                if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&data) {
+                if let Some(decompressed) = decompress_size_prepended_capped(&data) {
                     state.try_ms_write(&ws_encode_mod(src, &decompressed));
                 }
             }
@@ -1532,12 +1554,7 @@ impl NetManager {
                 // the host on both backends (Steam pushes my_id; the tangled host
                 // has PeerId(0) == self in its peer set), so filter self out here.
                 let my_id = self.peer.my_id();
-                let n_peers = self
-                    .peer
-                    .iter_peer_ids()
-                    .into_iter()
-                    .filter(|p| *p != my_id)
-                    .count();
+                let n_peers = self.peer.count_peer_ids_excluding(my_id);
                 state.world.add_end(data[0], &pos, n_peers);
             }
             key => {
