@@ -1221,6 +1221,12 @@ impl Tags<u16> {
         self.0 &= !(1 << n)
     }
 }
+// `Tags<u16>` is a 16-bit bitset indexed by a tag enum's ordinal via `1 << n`, so any
+// enum feeding it must keep its highest ordinal below 16 or the shift overflows. Guard
+// the last (highest-discriminant) variant of each such enum at compile time; keep these
+// pointed at whatever variant is declared last.
+const _: () = assert!((ComponentTag::None as u16) < u16::BITS as u16);
+const _: () = assert!((CachedTag::EggItem as u16) < u16::BITS as u16);
 
 impl ComponentData {
     fn new(id: ComponentID, is_var: bool) -> Self {
