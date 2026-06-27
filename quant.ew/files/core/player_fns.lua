@@ -72,9 +72,15 @@ local FireWand = ffi.typeof("FireWand")
 
 -- Remote-player movement smoothing (receiver-side interpolation). Tune live.
 local INTERP_DELAY = 0.10 -- fallback render delay (s) before a per-player gap EMA is established
-local BUFFER_SIZE = 8 -- max position samples kept per remote player
+local BUFFER_SIZE = 12 -- max position samples kept per remote player
 local MAX_EXTRAP = 0.15 -- seconds; cap on extrapolation past the newest sample
-local TELEPORT_THRESHOLD_SQ = 256 * 256 -- a jump between consecutive samples beyond this snaps (no interp)
+-- Teleport detection is time-aware (issue #18): a jump only counts as a teleport (snap, no
+-- interp) if it exceeds what a player could plausibly cover in the elapsed inter-sample time.
+-- A fixed distance misfired when unreliable position samples were lost mid-movement -- the next
+-- received sample is then far from the last purely from normal motion across the gap, which made
+-- the remote player appear to teleport. Threshold = base + max_speed * dt.
+local TELEPORT_BASE_PX = 256 -- floor: a jump below this is never treated as a teleport
+local TELEPORT_SPEED_PXPS = 3000 -- max plausible player speed (px/s, generous for levitation/speed perks); scales the threshold by gap
 
 local player_fns = {
     deserialize_inputs = function(message, player_data)
@@ -501,9 +507,14 @@ function player_fns.push_position_sample(player_data, x, y, t)
     if n > 0 then
         local last = buf[n]
         local dx, dy = x - last.x, y - last.y
-        if dx * dx + dy * dy > TELEPORT_THRESHOLD_SQ then
-            -- Teleport / respawn / world-change: don't interpolate across the gap; start fresh so
-            -- the next frame snaps to the new sample (single-sample case below).
+        local dt = t - last.t
+        if dt < 0 then
+            dt = 0
+        end
+        local max_move = TELEPORT_BASE_PX + TELEPORT_SPEED_PXPS * dt
+        if dx * dx + dy * dy > max_move * max_move then
+            -- Real teleport / respawn / world-change (jump exceeds plausible movement for the gap):
+            -- don't interpolate across it; start fresh so the next frame snaps to the new sample.
             for i = n, 1, -1 do
                 buf[i] = nil
             end

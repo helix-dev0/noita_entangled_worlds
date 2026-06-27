@@ -204,14 +204,15 @@ function world.encode_area(start_x_ini, start_y_ini, end_x_ini, end_y_ini, encod
     encoded_area.header.width = width - 1
     encoded_area.header.height = height - 1
 
-    encoded_area.header.pixel_run_count = ewext.encode_area(
+    local run_count, fire_count = ewext.encode_area(
         start_x_ini,
         start_y_ini,
         end_x_ini,
         end_y_ini,
         tonumber(ffi.cast("intptr_t", encoded_area.pixel_runs))
     )
-    return encoded_area
+    encoded_area.header.pixel_run_count = run_count
+    return encoded_area, fire_count
 end
 
 --local PixelRun_const_ptr = ffi.typeof("struct PixelRun const*")

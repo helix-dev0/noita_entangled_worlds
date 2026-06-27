@@ -148,10 +148,12 @@ fn encode_area(lua: LuaState) -> ValuesOnStack {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let pws = state.particle_world_state.as_mut().unwrap();
-        let runs = unsafe { pws.encode_area(start_x, start_y, end_x, end_y, encoded_buffer) };
+        let (runs, fire) =
+            unsafe { pws.encode_area(start_x, start_y, end_x, end_y, encoded_buffer) };
         unsafe { LUA.lua_pushinteger(lua, runs as isize) };
+        unsafe { LUA.lua_pushinteger(lua, fire as isize) };
     });
-    ValuesOnStack(1)
+    ValuesOnStack(2)
 }
 
 pub fn ephemerial(entity_id: u32) -> eyre::Result<()> {
