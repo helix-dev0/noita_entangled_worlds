@@ -163,6 +163,19 @@ end
 
 local was_held = {}
 
+-- Reusable scratch tables for the per-entity EnemyData* constructors below.
+-- ffi struct construction copies field values out of the initializer table and
+-- keeps no reference to it, so refilling one dedicated table per variant each
+-- loop iteration yields byte-identical cdata to allocating a fresh literal,
+-- while avoiding a table allocation per synced entity per frame. One table per
+-- variant means the exact same key set is always written, so no stale field can
+-- leak into a struct. The cdata (en_data) is what gets retained in
+-- enemy_data_list and serialized -- these tables never are.
+local scratch_enemy = { enemy_id = 0, x = 0, y = 0, vx = 0, vy = 0 }
+local scratch_nomotion = { enemy_id = 0, x = 0, y = 0 }
+local scratch_worm = { enemy_id = 0, x = 0, y = 0, vx = 0, vy = 0, tx = 0, ty = 0 }
+local scratch_fish = { enemy_id = 0, x = 0, y = 0, vx = 0, vy = 0, r = 0 }
+
 function enemy_sync.host_upload_entities()
     local entities = get_sync_entities()
     local enemy_data_list = {}
@@ -254,38 +267,34 @@ function enemy_sync.host_upload_entities()
             })
         elseif worm ~= nil then
             local tx, ty = ComponentGetValue2(worm, "mTargetVec")
-            en_data = EnemyDataWorm({
-                enemy_id = enemy_id,
-                x = x,
-                y = y,
-                vx = vx,
-                vy = vy,
-                tx = tx,
-                ty = ty,
-            })
+            scratch_worm.enemy_id = enemy_id
+            scratch_worm.x = x
+            scratch_worm.y = y
+            scratch_worm.vx = vx
+            scratch_worm.vy = vy
+            scratch_worm.tx = tx
+            scratch_worm.ty = ty
+            en_data = EnemyDataWorm(scratch_worm)
         elseif math.abs(vx) < 0.01 and math.abs(vy) < 0.01 then
-            en_data = EnemyDataNoMotion({
-                enemy_id = enemy_id,
-                x = x,
-                y = y,
-            })
+            scratch_nomotion.enemy_id = enemy_id
+            scratch_nomotion.x = x
+            scratch_nomotion.y = y
+            en_data = EnemyDataNoMotion(scratch_nomotion)
         elseif EntityGetFirstComponentIncludingDisabled(enemy_id, "AdvancedFishAIComponent") ~= nil then
-            en_data = EnemyDataFish({
-                enemy_id = enemy_id,
-                x = x,
-                y = y,
-                vx = vx,
-                vy = vy,
-                r = math.floor((rot % FULL_TURN) / FULL_TURN * 255),
-            })
+            scratch_fish.enemy_id = enemy_id
+            scratch_fish.x = x
+            scratch_fish.y = y
+            scratch_fish.vx = vx
+            scratch_fish.vy = vy
+            scratch_fish.r = math.floor((rot % FULL_TURN) / FULL_TURN * 255)
+            en_data = EnemyDataFish(scratch_fish)
         else
-            en_data = EnemyData({
-                enemy_id = enemy_id,
-                x = x,
-                y = y,
-                vx = vx,
-                vy = vy,
-            })
+            scratch_enemy.enemy_id = enemy_id
+            scratch_enemy.x = x
+            scratch_enemy.y = y
+            scratch_enemy.vx = vx
+            scratch_enemy.vy = vy
+            en_data = EnemyData(scratch_enemy)
         end
 
         local wand
